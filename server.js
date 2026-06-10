@@ -1,15 +1,32 @@
-// server.js (フェーズA-1: 会話履歴のサーバー側保存対応)
+// server.js
+// ==============================================================================
+// RAiM 中継サーバー：Flutter ↔ Ollama/Bedrock のブリッジ
+// ==============================================================================
 //
-// 変更点:
-// - MemoryStore を導入し、actorId/sessionId 単位で履歴を保持
-// - WebSocket 接続時に sessionID を発行し、session_start メッセージで Flutter に通知
-// - Flutter から送られる session_id を受信し、対応する履歴を listEvents で取得
-// - 履歴を prompt-builder に渡してプロンプトに含める
-// - 応答完了後、createEvent で履歴を記録
+// 【このファイルの役割】
+// Flutter からの WebSocket 接続を受け、シーン判定 → 履歴取得 → プロンプト組立
+// → LLM 推論 → 応答返却 までの一連の流れを統括する。
+//
+// 【処理の流れ】
+//   [Flutter] ─ ws.send({text}) ──→ [server.js]
+//                                       │
+//                                       ├ Embedding でシーン判定 (pick-scene.js)
+//                                       ├ 履歴取得 (memory-store.js)  ※並列実行
+//                                       │
+//                                       ├ プロンプト組立 (prompt-builder.js)
+//                                       │
+//                                       ├ LLM 推論 (llm.js)
+//                                       │
+//                                       ├ 履歴に記録 (memory-store.js)
+//                                       │
+//                                       └ 応答送信 ─→ [Flutter]
+//
+// 【接続管理】
+// 1接続=1セッション。接続時に session_start を Flutter に送る。
+// 切断したら別セッション扱い（再接続時は新セッション）
 
 require('dotenv').config();
 const { WebSocketServer } = require('ws');
-const { randomUUID } = require('crypto');
 const { callLLM } = require('./lib/llm');
 const { buildMessages } = require('./lib/prompt-builder');
 const { pickScene } = require('./lib/pick-scene');
@@ -20,27 +37,38 @@ const {
   createChat,
   createFiller,
   createError,
+  createSessionStart,
   normalizeLLMOutput,
   validateUpstream,
-  SCHEMA_VERSION,
 } = require('./lib/types');
 
+// ─────────────────────────────────────────────
+// サーバー設定
+// ─────────────────────────────────────────────
+
 const PORT = 8080;
+
+// MemoryStore のインスタンス
+// RAIM_MODE 環境変数によりローカル/本番 が切り替わる
 const memoryStore = MemoryStore.create();
 
-// ─────────────────────────────────────────────
-// 仮の actorId（将来の認証で差し替える）
-// 今は全ユーザー共通の "default_user"
-// ─────────────────────────────────────────────
+// 仮の actorId（ユーザー識別子）
+// 今は全ユーザー共通の固定値だが、将来の認証実装で個人ごとに差し替える
 const DEFAULT_ACTOR_ID = 'default_user';
 
 // ─────────────────────────────────────────────
-// ヘビー処理判定（つなぎ言葉を出すかどうか）
+// ヘビー処理判定
 // ─────────────────────────────────────────────
+//
+// 検索や時間のかかる処理が必要そうな質問を、キーワードで判定する。
+// 真なら filler_audio を即座に Flutter に送って「考え中感」を演出。
+// 偽なら通常通り chat を1回返すだけ。
+
 function needsHeavyProcessing(text) {
   return /(天気|ニュース|調べて|教えて|検索|何時|今いつ)/.test(text);
 }
 
+// つなぎ言葉のバリエーション（毎回同じだと不自然なのでランダム）
 const FILLER_PHRASES = [
   'んー、ちょっと待ってね。今調べるから……',
   'えっと、それね……ちょっと考えるね。',
@@ -53,36 +81,39 @@ function pickFiller() {
 }
 
 // ─────────────────────────────────────────────
-// WebSocket サーバー
+// WebSocket サーバー本体
 // ─────────────────────────────────────────────
+
 const wss = new WebSocketServer({ port: PORT });
 console.log(`\u2713 RAiM local server listening on ws://127.0.0.1:${PORT}`);
 
 wss.on('connection', async (ws) => {
   console.log('[+] Client connected');
 
-  // 接続単位でセッション情報を保持
+  // この接続専用のコンテキスト
+  // 1接続 = 1セッション
   const connectionContext = {
     actorId: DEFAULT_ACTOR_ID,
-    sessionId: null, // session_start で発行
+    sessionId: null,  // この後 startSession で発行
   };
 
-  // ① 接続時に sessionId を発行し、Flutter に通知
+  // ─── 接続時の初期化 ───
+  // セッション開始 → sessionID 発行 → Flutter に通知
   const { sessionId } = await memoryStore.startSession({
     actorId: connectionContext.actorId,
-    sessionId: null,
+    sessionId: null,  // null を渡すと新規発行
   });
   connectionContext.sessionId = sessionId;
 
-  ws.send(JSON.stringify({
-    version: SCHEMA_VERSION,
-    type: 'session_start',
-    session_id: sessionId,
-  }));
+  // session_start メッセージで Flutter に sessionID を伝える
+  // Flutter はこの ID を内部保持し、以降の send に含める
+  ws.send(JSON.stringify(createSessionStart({ sessionId })));
   console.log(`[~] Session started: ${sessionId}`);
 
+  // ─── メッセージ受信ハンドラ ───
   ws.on('message', async (rawData) => {
-    // 受信メッセージのパース + バリデーション
+
+    // ① パース
     let parsed;
     try {
       parsed = JSON.parse(rawData.toString());
@@ -95,6 +126,7 @@ wss.on('connection', async (ws) => {
       return;
     }
 
+    // ② バリデーション
     const validation = validateUpstream(parsed);
     if (!validation.valid) {
       ws.send(JSON.stringify(createError({
@@ -105,8 +137,9 @@ wss.on('connection', async (ws) => {
       return;
     }
 
-    // session_id が指定されていればそれを使い、なければ接続時のものを使う
-    // （Flutter 側が手動でセッション切り替える時の備え）
+    // ③ sessionID の決定
+    // - Flutter から指定があればそれを使う（手動セッション切替の備え）
+    // - なければ接続時に発行したものを使う
     const sessionId = parsed.session_id || connectionContext.sessionId;
     const actorId = connectionContext.actorId;
     const userMessage = validation.message.text;
@@ -114,7 +147,8 @@ wss.on('connection', async (ws) => {
     console.log(`[<] User: ${userMessage} (session=${sessionId})`);
 
     try {
-      // ② ヘビー処理が必要そうなら、即座につなぎセリフを送る
+      // ④ ヘビー処理判定 → 必要ならつなぎ言葉を即送信
+      // これは LLM 推論を待たずに送れるので、体感レイテンシが激減する
       if (needsHeavyProcessing(userMessage)) {
         const fillerText = pickFiller();
         ws.send(JSON.stringify(createFiller({
@@ -125,7 +159,9 @@ wss.on('connection', async (ws) => {
         console.log(`[>>] Filler: ${fillerText}`);
       }
 
-      // ③ シーン判定と履歴取得を並列実行（フェーズA-2 の先取り）
+      // ⑤ シーン判定 と 履歴取得 を並列実行
+      // 両方とも独立した処理（依存関係なし）なので並列で時間短縮
+      // Promise.all を使うことで、シーン判定が遅くても履歴取得は並行に進む
       const t0 = Date.now();
       const [picked, pastEvents] = await Promise.all([
         pickScene(userMessage),
@@ -133,42 +169,42 @@ wss.on('connection', async (ws) => {
       ]);
       const t1 = Date.now();
 
+      // 履歴を LLM 用の messages 形式に変換
       const history = eventsToMessages(pastEvents);
       console.log(`[?] Scene: ${picked.scene.id} (score=${picked.score.toFixed(3)}, ${t1 - t0}ms, history=${history.length} turns)`);
 
-      // ④ プロンプト組立と LLM 推論
+      // ⑥ プロンプト組立 → LLM 推論
       const messages = buildMessages(picked.scene, userMessage, history);
       const rawLLMOutput = await callLLM(messages);
       const t2 = Date.now();
 
-      // ⑤ LLM 応答を正規化
+      // ⑦ LLM 応答を正規化（コードフェンス除去・パース・整形）
       const normalized = normalizeLLMOutput(rawLLMOutput);
 
       console.log(`[>] RAiM: ${normalized.text || normalized.message} (LLM: ${t2 - t1}ms, total: ${t2 - t0}ms)`);
 
-      // ⑥ 履歴に記録（ユーザー発言と応答を1イベントとして）
-      // chat 型の応答のみ記録（error 型は記録しない）
+      // ⑧ 履歴に記録
+      // chat 型の応答のみ記録（error 型を残すとライムが「調子悪い」前提で次回返答してしまう）
+      // ユーザー発言と応答を1イベントとしてまとめて記録
       if (normalized.type === 'chat') {
         await memoryStore.createEvent({
           actorId,
           sessionId,
           payload: [
-            {
-              role: Role.USER,
-              content: { text: userMessage },
-            },
-            {
-              role: Role.ASSISTANT,
-              content: { text: normalized.text },
-            },
+            { role: Role.USER, content: { text: userMessage } },
+            { role: Role.ASSISTANT, content: { text: normalized.text } },
           ],
         });
       }
 
+      // ⑨ 応答を Flutter に送信
       ws.send(JSON.stringify(normalized));
+
     } catch (err) {
       console.error('[!] Error:', err.message);
 
+      // エラー種別を推測してコード分類
+      // Flutter 側がコードで自動リトライ判断などをするための情報
       let code = ERROR_CODES.INTERNAL_ERROR;
       if (err.message.includes('LLM') || err.message.includes('Ollama')) {
         code = ERROR_CODES.LLM_ERROR;
@@ -184,6 +220,11 @@ wss.on('connection', async (ws) => {
     }
   });
 
+  // ─── 切断時 ───
+  // セッションを即座に消すわけではない（TTL 30分で自動削除される）
+  // 再接続時に同じ session_id を Flutter が指定すれば履歴を引き継げる
+  // （ただし現状の Flutter 側実装では切断時に session_id を破棄するので、
+  //  再接続時は新セッションとなる。将来の「会話継続」機能で活用予定）
   ws.on('close', () => {
     console.log(`[-] Client disconnected (session=${connectionContext.sessionId})`);
   });
