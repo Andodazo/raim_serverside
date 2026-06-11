@@ -1,40 +1,56 @@
 // server.js
 // ==============================================================================
-// RAiM 中継サーバー：Flutter ↔ Ollama/Bedrock のブリッジ
+// RAiM 中継サーバー：マルチモーダル対応版
 // ==============================================================================
 //
 // 【このファイルの役割】
-// Flutter からの WebSocket 接続を受け、シーン判定 → 履歴取得 → プロンプト組立
-// → LLM 推論 → 応答返却 までの一連の流れを統括する。
+// Flutter からの WebSocket 接続を受け、テキスト+画像の入力を処理して
+// シーン判定 → 履歴取得 → プロンプト組立 → LLM 推論 → 応答返却 を統括する。
 //
-// 【処理の流れ】
-//   [Flutter] ─ ws.send({text}) ──→ [server.js]
-//                                       │
-//                                       ├ Embedding でシーン判定 (pick-scene.js)
-//                                       ├ 履歴取得 (memory-store.js)  ※並列実行
-//                                       │
-//                                       ├ プロンプト組立 (prompt-builder.js)
-//                                       │
-//                                       ├ LLM 推論 (llm.js)
-//                                       │
-//                                       ├ 履歴に記録 (memory-store.js)
-//                                       │
-//                                       └ 応答送信 ─→ [Flutter]
+// 【マルチモーダル対応の変更点】
+// - Flutter から { text, images: [{data, media_type}], session_id } を受信
+// - images.data（Base64）を抽出して pickScene と buildMessages に渡す
+// - 応答 JSON の image_description（内部用）を履歴記録時に活用
+// - Flutter には image_description を送らない（types.js の normalizeLLMOutput で除去）
+// - ログに images=N / hasImage=true を出力
 //
-// 【接続管理】
-// 1接続=1セッション。接続時に session_start を Flutter に送る。
-// 切断したら別セッション扱い（再接続時は新セッション）
+// 【処理フロー】
+//   [Flutter] ─ ws.send({text, images, session_id}) ──→ [server.js]
+//                                                          │
+//                                                          ├ images の Base64 を取り出し
+//                                                          │
+//                                                          ├ pickScene(text, {images})
+//                                                          │   → hasImage バイアス補正でシーン判定
+//                                                          │
+//                                                          ├ memoryStore.listEvents() ← 並列
+//                                                          │
+//                                                          ├ buildMessages(scene, text, history, imageData)
+//                                                          │   → Ollama 形式の images 添付
+//                                                          │
+//                                                          ├ callLLM(messages) ← Gemma 3 マルチモーダル推論
+//                                                          │   → JSON 応答（image_description 含む）
+//                                                          │
+//                                                          ├ normalizeLLMOutput で image_description 抽出
+//                                                          │
+//                                                          ├ memoryStore.createEvent()
+//                                                          │   ユーザー発言に [画像: 説明文] を埋め込んで記録
+//                                                          │
+//                                                          └ chat メッセージを Flutter へ送信（image_description 除く）
 
 require('dotenv').config();
 const { WebSocketServer } = require('ws');
 const { callLLM } = require('./lib/llm');
 const { buildMessages } = require('./lib/prompt-builder');
 const { pickScene } = require('./lib/pick-scene');
-const { MemoryStore, Role, eventsToMessages } = require('./lib/memory-store');
+const {
+  MemoryStore,
+  Role,
+  eventsToMessages,
+  buildUserContentWithImage,
+} = require('./lib/memory-store');
 const {
   EMOTIONS,
   ERROR_CODES,
-  createChat,
   createFiller,
   createError,
   createSessionStart,
@@ -47,37 +63,40 @@ const {
 // ─────────────────────────────────────────────
 
 const PORT = 8080;
-
-// MemoryStore のインスタンス
-// RAIM_MODE 環境変数によりローカル/本番 が切り替わる
 const memoryStore = MemoryStore.create();
 
-// 仮の actorId（ユーザー識別子）
-// 今は全ユーザー共通の固定値だが、将来の認証実装で個人ごとに差し替える
+// 仮の actorId（将来の認証で個人ごとに差し替え）
 const DEFAULT_ACTOR_ID = 'default_user';
 
 // ─────────────────────────────────────────────
-// ヘビー処理判定
+// ヘビー処理判定（つなぎ言葉を出すかどうか）
 // ─────────────────────────────────────────────
-//
-// 検索や時間のかかる処理が必要そうな質問を、キーワードで判定する。
-// 真なら filler_audio を即座に Flutter に送って「考え中感」を演出。
-// 偽なら通常通り chat を1回返すだけ。
 
-function needsHeavyProcessing(text) {
+function needsHeavyProcessing(text, hasImage) {
+  // 画像がある時は推論が長くなりがちなのでつなぎ言葉を出す
+  if (hasImage) return true;
+  // テキストでも検索系キーワードがあればつなぎ言葉
   return /(天気|ニュース|調べて|教えて|検索|何時|今いつ)/.test(text);
 }
 
-// つなぎ言葉のバリエーション（毎回同じだと不自然なのでランダム）
 const FILLER_PHRASES = [
-  'んー、ちょっと待ってね。今調べるから……',
+  'んー、ちょっと待ってね。今見てるから……',
   'えっと、それね……ちょっと考えるね。',
-  'あ、それ気になる。少し待って?',
+  'あ、それ気になる。少し待って？',
   'うーん、それは……ちょっと整理させて。',
 ];
 
-function pickFiller() {
-  return FILLER_PHRASES[Math.floor(Math.random() * FILLER_PHRASES.length)];
+// 画像専用のつなぎ言葉（「見る」表現）
+const FILLER_PHRASES_IMAGE = [
+  'えっ、何これ？……ちょっと見せて？',
+  'うわ、面白そう。ちょっと見るね？',
+  '画像？ふふ、何が写ってるんだろう……',
+  'お、写真くれた？ちょっと待ってね……',
+];
+
+function pickFiller(hasImage) {
+  const pool = hasImage ? FILLER_PHRASES_IMAGE : FILLER_PHRASES;
+  return pool[Math.floor(Math.random() * pool.length)];
 }
 
 // ─────────────────────────────────────────────
@@ -90,23 +109,19 @@ console.log(`\u2713 RAiM local server listening on ws://127.0.0.1:${PORT}`);
 wss.on('connection', async (ws) => {
   console.log('[+] Client connected');
 
-  // この接続専用のコンテキスト
-  // 1接続 = 1セッション
+  // 接続単位でセッション情報を保持
   const connectionContext = {
     actorId: DEFAULT_ACTOR_ID,
-    sessionId: null,  // この後 startSession で発行
+    sessionId: null,
   };
 
-  // ─── 接続時の初期化 ───
-  // セッション開始 → sessionID 発行 → Flutter に通知
+  // ─── 接続時の初期化：セッション開始 + 通知 ───
   const { sessionId } = await memoryStore.startSession({
     actorId: connectionContext.actorId,
-    sessionId: null,  // null を渡すと新規発行
+    sessionId: null,
   });
   connectionContext.sessionId = sessionId;
 
-  // session_start メッセージで Flutter に sessionID を伝える
-  // Flutter はこの ID を内部保持し、以降の send に含める
   ws.send(JSON.stringify(createSessionStart({ sessionId })));
   console.log(`[~] Session started: ${sessionId}`);
 
@@ -127,6 +142,7 @@ wss.on('connection', async (ws) => {
     }
 
     // ② バリデーション
+    // types.js の validateUpstream で images 配列のバリデーションも含めて実施
     const validation = validateUpstream(parsed);
     if (!validation.valid) {
       ws.send(JSON.stringify(createError({
@@ -137,20 +153,20 @@ wss.on('connection', async (ws) => {
       return;
     }
 
-    // ③ sessionID の決定
-    // - Flutter から指定があればそれを使う（手動セッション切替の備え）
-    // - なければ接続時に発行したものを使う
+    // ③ パラメータ取得
     const sessionId = parsed.session_id || connectionContext.sessionId;
     const actorId = connectionContext.actorId;
     const userMessage = validation.message.text;
+    const imageObjects = parsed.images || []; // [{data, media_type}, ...]
+    const imageBase64Array = imageObjects.map(img => img.data); // ['base64...', ...]
+    const hasImage = imageBase64Array.length > 0;
 
-    console.log(`[<] User: ${userMessage} (session=${sessionId})`);
+    console.log(`[<] User: ${userMessage} (session=${sessionId}${hasImage ? `, images=${imageBase64Array.length}` : ''})`);
 
     try {
-      // ④ ヘビー処理判定 → 必要ならつなぎ言葉を即送信
-      // これは LLM 推論を待たずに送れるので、体感レイテンシが激減する
-      if (needsHeavyProcessing(userMessage)) {
-        const fillerText = pickFiller();
+      // ④ ヘビー処理ならつなぎ言葉を即送信
+      if (needsHeavyProcessing(userMessage, hasImage)) {
+        const fillerText = pickFiller(hasImage);
         ws.send(JSON.stringify(createFiller({
           text: fillerText,
           emotion: EMOTIONS.NEUTRAL,
@@ -160,51 +176,73 @@ wss.on('connection', async (ws) => {
       }
 
       // ⑤ シーン判定 と 履歴取得 を並列実行
-      // 両方とも独立した処理（依存関係なし）なので並列で時間短縮
-      // Promise.all を使うことで、シーン判定が遅くても履歴取得は並行に進む
       const t0 = Date.now();
       const [picked, pastEvents] = await Promise.all([
-        pickScene(userMessage),
+        pickScene(userMessage, { images: imageBase64Array }),
         memoryStore.listEvents({ actorId, sessionId }),
       ]);
       const t1 = Date.now();
 
-      // 履歴を LLM 用の messages 形式に変換
       const history = eventsToMessages(pastEvents);
-      console.log(`[?] Scene: ${picked.scene.id} (score=${picked.score.toFixed(3)}, ${t1 - t0}ms, history=${history.length} turns)`);
+      console.log(
+        `[?] Scene: ${picked.scene.id} ` +
+        `(score=${picked.score.toFixed(3)}, ${t1 - t0}ms, ` +
+        `history=${history.length} turns, hasImage=${hasImage})`
+      );
 
-      // ⑥ プロンプト組立 → LLM 推論
-      const messages = buildMessages(picked.scene, userMessage, history);
+      // ⑥ プロンプト組立（画像も含めて Ollama messages 形式に）
+      const messages = buildMessages(
+        picked.scene,
+        userMessage,
+        history,
+        imageBase64Array  // 画像 Base64 配列を渡す
+      );
+
+      // ⑦ LLM 推論
       const rawLLMOutput = await callLLM(messages);
       const t2 = Date.now();
 
-      // ⑦ LLM 応答を正規化（コードフェンス除去・パース・整形）
+      // ⑧ LLM 応答を正規化
+      // image_description は normalized._imageDescription として内部保持
+      // Flutter には送られない
       const normalized = normalizeLLMOutput(rawLLMOutput);
 
-      console.log(`[>] RAiM: ${normalized.text || normalized.message} (LLM: ${t2 - t1}ms, total: ${t2 - t0}ms)`);
+      console.log(
+        `[>] RAiM: ${normalized.text || normalized.message} ` +
+        `(LLM: ${t2 - t1}ms, total: ${t2 - t0}ms)`
+      );
 
-      // ⑧ 履歴に記録
-      // chat 型の応答のみ記録（error 型を残すとライムが「調子悪い」前提で次回返答してしまう）
-      // ユーザー発言と応答を1イベントとしてまとめて記録
+      // ⑨ 履歴に記録
+      // chat 型のみ記録（error は記録しない）
+      // ユーザー発言は画像説明と結合してテキスト化
       if (normalized.type === 'chat') {
+        // 画像説明があれば、それをユーザー発言に埋め込む
+        const imageDescription = normalized._imageDescription || null;
+        const userContent = buildUserContentWithImage(userMessage, imageDescription);
+
         await memoryStore.createEvent({
           actorId,
           sessionId,
           payload: [
-            { role: Role.USER, content: { text: userMessage } },
+            { role: Role.USER, content: { text: userContent } },
             { role: Role.ASSISTANT, content: { text: normalized.text } },
           ],
         });
+
+        if (imageDescription) {
+          console.log(`[+] Image described: "${imageDescription.slice(0, 60)}..."`);
+        }
       }
 
-      // ⑨ 応答を Flutter に送信
-      ws.send(JSON.stringify(normalized));
+      // ⑩ Flutter に送信（_imageDescription は除去して送る）
+      // _ で始まるフィールドは types.js 側で除外される設計だが、ここでも明示的に消す
+      const outputMsg = { ...normalized };
+      delete outputMsg._imageDescription;
+      ws.send(JSON.stringify(outputMsg));
 
     } catch (err) {
       console.error('[!] Error:', err.message);
 
-      // エラー種別を推測してコード分類
-      // Flutter 側がコードで自動リトライ判断などをするための情報
       let code = ERROR_CODES.INTERNAL_ERROR;
       if (err.message.includes('LLM') || err.message.includes('Ollama')) {
         code = ERROR_CODES.LLM_ERROR;
@@ -220,11 +258,6 @@ wss.on('connection', async (ws) => {
     }
   });
 
-  // ─── 切断時 ───
-  // セッションを即座に消すわけではない（TTL 30分で自動削除される）
-  // 再接続時に同じ session_id を Flutter が指定すれば履歴を引き継げる
-  // （ただし現状の Flutter 側実装では切断時に session_id を破棄するので、
-  //  再接続時は新セッションとなる。将来の「会話継続」機能で活用予定）
   ws.on('close', () => {
     console.log(`[-] Client disconnected (session=${connectionContext.sessionId})`);
   });
