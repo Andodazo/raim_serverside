@@ -37,9 +37,35 @@
 //                                                          │
 //                                                          └ chat メッセージを Flutter へ送信（image_description 除く）
 
+// ==============================================================================
+// RAiM 中継サーバー：ストリーミング応答対応版
+// ==============================================================================
+//
+// 【v5 での変更点】
+// - 応答を 3 段階で送信:
+//   1. metadata (即時、emotion / intensity 先送り) → Unity 表情切替・TTS準備
+//   2. text_chunk (LLM 推論進行中、句読点ごと) → UI 表示・TTS 順次合成
+//   3. chat_end (LLM 推論完了) → TTS キュー完了
+// - LLM はストリーミング呼出 (callLLMStream) を使用
+// - StreamingTextExtractor で text フィールドの値だけ抽出
+//
+// 【ユーザー体験の改善】
+// 旧: ユーザー送信 → 5〜10秒待ち → 全文一括表示・音声再生
+// 新: ユーザー送信 → 即時 emotion 反映 → 1〜2秒で喋り始め → 順次表示・音声
+//
+// 【v6 での変更点】
+// - RAIM_STREAMING 環境変数でストリーミング ON/OFF を切替可能に
+//   - true (デフォルト): ストリーミング応答 (metadata + text_chunk + chat_end)
+//   - false: 従来の一括 chat 応答（旧クライアント互換）
+// - 旧クライアントでテストしたい時は .env で RAIM_STREAMING=false にする
+//
+// 【処理の分岐ポイント】
+// ストリーミング ON  → handleStreaming() で 3 段階送信
+// ストリーミング OFF → handleNonStreaming() で chat メッセージ 1 個送信
+
 require('dotenv').config();
 const { WebSocketServer } = require('ws');
-const { callLLM } = require('./lib/llm');
+const { callLLM, callLLMStream } = require('./lib/llm');
 const { buildMessages } = require('./lib/prompt-builder');
 const { pickScene } = require('./lib/pick-scene');
 const {
@@ -48,12 +74,16 @@ const {
   eventsToMessages,
   buildUserContentWithImage,
 } = require('./lib/memory-store');
+const { StreamingTextExtractor } = require('./lib/streaming-parser');
 const {
   EMOTIONS,
   ERROR_CODES,
   createFiller,
   createError,
   createSessionStart,
+  createMetadata,
+  createTextChunk,
+  createChatEnd,
   normalizeLLMOutput,
   validateUpstream,
 } = require('./lib/types');
@@ -64,34 +94,32 @@ const {
 
 const PORT = 8080;
 const memoryStore = MemoryStore.create();
-
-// 仮の actorId（将来の認証で個人ごとに差し替え）
 const DEFAULT_ACTOR_ID = 'default_user';
 
+// ストリーミング応答の有効化フラグ
+// .env で RAIM_STREAMING=false に設定すると、従来の一括応答に戻る
+// 旧クライアントで動作確認したい時に false にする
+const STREAMING_ENABLED = process.env.RAIM_STREAMING !== 'false';
+
 // ─────────────────────────────────────────────
-// ヘビー処理判定（つなぎ言葉を出すかどうか）
+// ヘビー処理判定（つなぎ言葉用）
 // ─────────────────────────────────────────────
 
 function needsHeavyProcessing(text, hasImage) {
-  // 画像がある時は推論が長くなりがちなのでつなぎ言葉を出す
   if (hasImage) return true;
-  // テキストでも検索系キーワードがあればつなぎ言葉
   return /(天気|ニュース|調べて|教えて|検索|何時|今いつ)/.test(text);
 }
 
 const FILLER_PHRASES = [
-  'んー、ちょっと待ってね。今見てるから……',
-  'えっと、それね……ちょっと考えるね。',
+  'んー、ちょっと待ってね……',
+  'えっと、それね……',
   'あ、それ気になる。少し待って？',
-  'うーん、それは……ちょっと整理させて。',
 ];
 
-// 画像専用のつなぎ言葉（「見る」表現）
 const FILLER_PHRASES_IMAGE = [
-  'えっ、何これ？……ちょっと見せて？',
-  'うわ、面白そう。ちょっと見るね？',
-  '画像？ふふ、何が写ってるんだろう……',
-  'お、写真くれた？ちょっと待ってね……',
+  'えっ、何これ？……',
+  'うわ、面白そう。',
+  '画像？ふふ、見てみるね……',
 ];
 
 function pickFiller(hasImage) {
@@ -105,17 +133,17 @@ function pickFiller(hasImage) {
 
 const wss = new WebSocketServer({ port: PORT });
 console.log(`\u2713 RAiM local server listening on ws://127.0.0.1:${PORT}`);
+console.log(`  Streaming mode: ${STREAMING_ENABLED ? 'ON' : 'OFF'}`);
 
 wss.on('connection', async (ws) => {
   console.log('[+] Client connected');
 
-  // 接続単位でセッション情報を保持
   const connectionContext = {
     actorId: DEFAULT_ACTOR_ID,
     sessionId: null,
   };
 
-  // ─── 接続時の初期化：セッション開始 + 通知 ───
+  // ─── 接続時の初期化 ───
   const { sessionId } = await memoryStore.startSession({
     actorId: connectionContext.actorId,
     sessionId: null,
@@ -142,7 +170,6 @@ wss.on('connection', async (ws) => {
     }
 
     // ② バリデーション
-    // types.js の validateUpstream で images 配列のバリデーションも含めて実施
     const validation = validateUpstream(parsed);
     if (!validation.valid) {
       ws.send(JSON.stringify(createError({
@@ -157,26 +184,16 @@ wss.on('connection', async (ws) => {
     const sessionId = parsed.session_id || connectionContext.sessionId;
     const actorId = connectionContext.actorId;
     const userMessage = validation.message.text;
-    const imageObjects = parsed.images || []; // [{data, media_type}, ...]
-    const imageBase64Array = imageObjects.map(img => img.data); // ['base64...', ...]
+    const imageObjects = parsed.images || [];
+    const imageBase64Array = imageObjects.map(img => img.data);
     const hasImage = imageBase64Array.length > 0;
 
     console.log(`[<] User: ${userMessage} (session=${sessionId}${hasImage ? `, images=${imageBase64Array.length}` : ''})`);
 
     try {
-      // ④ ヘビー処理ならつなぎ言葉を即送信
-      if (needsHeavyProcessing(userMessage, hasImage)) {
-        const fillerText = pickFiller(hasImage);
-        ws.send(JSON.stringify(createFiller({
-          text: fillerText,
-          emotion: EMOTIONS.NEUTRAL,
-          intensity: 0.5,
-        })));
-        console.log(`[>>] Filler: ${fillerText}`);
-      }
-
-      // ⑤ シーン判定 と 履歴取得 を並列実行
       const t0 = Date.now();
+
+      // ④ シーン判定 + 履歴取得（並列）
       const [picked, pastEvents] = await Promise.all([
         pickScene(userMessage, { images: imageBase64Array }),
         memoryStore.listEvents({ actorId, sessionId }),
@@ -190,55 +207,24 @@ wss.on('connection', async (ws) => {
         `history=${history.length} turns, hasImage=${hasImage})`
       );
 
-      // ⑥ プロンプト組立（画像も含めて Ollama messages 形式に）
+      // ⑤ プロンプト組立
       const messages = buildMessages(
         picked.scene,
         userMessage,
         history,
-        imageBase64Array  // 画像 Base64 配列を渡す
+        imageBase64Array
       );
 
-      // ⑦ LLM 推論
-      const rawLLMOutput = await callLLM(messages);
-      const t2 = Date.now();
-
-      // ⑧ LLM 応答を正規化
-      // image_description は normalized._imageDescription として内部保持
-      // Flutter には送られない
-      const normalized = normalizeLLMOutput(rawLLMOutput);
-
-      console.log(
-        `[>] RAiM: ${normalized.text || normalized.message} ` +
-        `(LLM: ${t2 - t1}ms, total: ${t2 - t0}ms)`
-      );
-
-      // ⑨ 履歴に記録
-      // chat 型のみ記録（error は記録しない）
-      // ユーザー発言は画像説明と結合してテキスト化
-      if (normalized.type === 'chat') {
-        // 画像説明があれば、それをユーザー発言に埋め込む
-        const imageDescription = normalized._imageDescription || null;
-        const userContent = buildUserContentWithImage(userMessage, imageDescription);
-
-        await memoryStore.createEvent({
-          actorId,
-          sessionId,
-          payload: [
-            { role: Role.USER, content: { text: userContent } },
-            { role: Role.ASSISTANT, content: { text: normalized.text } },
-          ],
+      // ⑥ ストリーミング ON/OFF で分岐
+      if (STREAMING_ENABLED) {
+        await handleStreaming(ws, picked, messages, userMessage, hasImage, {
+          actorId, sessionId, t0, t1,
         });
-
-        if (imageDescription) {
-          console.log(`[+] Image described: "${imageDescription.slice(0, 60)}..."`);
-        }
+      } else {
+        await handleNonStreaming(ws, picked, messages, userMessage, hasImage, {
+          actorId, sessionId, t0, t1,
+        });
       }
-
-      // ⑩ Flutter に送信（_imageDescription は除去して送る）
-      // _ で始まるフィールドは types.js 側で除外される設計だが、ここでも明示的に消す
-      const outputMsg = { ...normalized };
-      delete outputMsg._imageDescription;
-      ws.send(JSON.stringify(outputMsg));
 
     } catch (err) {
       console.error('[!] Error:', err.message);
@@ -262,3 +248,166 @@ wss.on('connection', async (ws) => {
     console.log(`[-] Client disconnected (session=${connectionContext.sessionId})`);
   });
 });
+
+// ─────────────────────────────────────────────
+// ストリーミング応答（A-3 標準モード）
+// ─────────────────────────────────────────────
+//
+// metadata 即時 → text_chunk 順次 → chat_end 完了 の3段階送信
+
+async function handleStreaming(ws, picked, messages, userMessage, hasImage, ctx) {
+  const { actorId, sessionId, t0, t1 } = ctx;
+
+  // ⑤-1 metadata を即時送信
+  const metadataMsg = createMetadata({
+    emotion: picked.defaultEmotion,
+    intensity: picked.defaultIntensity,
+    sceneId: picked.scene.id,
+  });
+  ws.send(JSON.stringify(metadataMsg));
+  console.log(`[>] Metadata sent: emotion=${picked.defaultEmotion}, intensity=${picked.defaultIntensity}`);
+
+  // ⑤-2 つなぎ言葉（必要時のみ）
+  if (needsHeavyProcessing(userMessage, hasImage)) {
+    const fillerText = pickFiller(hasImage);
+    ws.send(JSON.stringify(createFiller({
+      text: fillerText,
+      emotion: picked.defaultEmotion,
+      intensity: 0.5,
+    })));
+    console.log(`[>>] Filler: ${fillerText}`);
+  }
+
+  // ⑤-3 LLM ストリーミング推論 + チャンク送信
+  const extractor = new StreamingTextExtractor();
+  let isFirstChunk = true;
+  let rawAccumulated = '';
+
+  for await (const token of callLLMStream(messages)) {
+    rawAccumulated += token;
+
+    const chunks = extractor.feed(token);
+    for (const chunk of chunks) {
+      ws.send(JSON.stringify(createTextChunk({
+        text: chunk,
+        isFirst: isFirstChunk,
+      })));
+      isFirstChunk = false;
+    }
+  }
+
+  const lastChunk = extractor.flush();
+  if (lastChunk && lastChunk.length > 0) {
+    ws.send(JSON.stringify(createTextChunk({
+      text: lastChunk,
+      isFirst: isFirstChunk,
+    })));
+  }
+
+  const t2 = Date.now();
+
+  // ⑤-4 chat_end で完全な情報を送信
+  let finalEmotion = picked.defaultEmotion;
+  let finalIntensity = picked.defaultIntensity;
+  let fullText = '';
+  let imageDescription = null;
+
+  try {
+    const cleaned = rawAccumulated
+      .replace(/^```json\s*/i, '')
+      .replace(/^```\s*/i, '')
+      .replace(/```\s*$/i, '')
+      .trim();
+    const finalJson = JSON.parse(cleaned);
+
+    fullText = finalJson.text || '';
+    if (finalJson.emotion) finalEmotion = finalJson.emotion;
+    if (typeof finalJson.intensity === 'number') finalIntensity = finalJson.intensity;
+    if (finalJson.image_description) imageDescription = finalJson.image_description;
+  } catch (e) {
+    console.warn('[!] Final JSON parse failed:', e.message);
+  }
+
+  ws.send(JSON.stringify(createChatEnd({
+    fullText,
+    emotion: finalEmotion,
+    intensity: finalIntensity,
+  })));
+  console.log(
+    `[>] chat_end: emotion=${finalEmotion}, intensity=${finalIntensity}, ` +
+    `text_len=${fullText.length}, LLM=${t2 - t1}ms, total=${t2 - t0}ms`
+  );
+
+  // ⑤-5 履歴に記録
+  const userContent = buildUserContentWithImage(userMessage, imageDescription);
+  await memoryStore.createEvent({
+    actorId,
+    sessionId,
+    payload: [
+      { role: Role.USER, content: { text: userContent } },
+      { role: Role.ASSISTANT, content: { text: fullText } },
+    ],
+  });
+
+  if (imageDescription) {
+    console.log(`[+] Image described: "${imageDescription.slice(0, 60)}..."`);
+  }
+}
+
+// ─────────────────────────────────────────────
+// 非ストリーミング応答（旧クライアント互換モード）
+// ─────────────────────────────────────────────
+//
+// 従来通り、LLM 推論完了後に chat メッセージ1個を送る
+// .env で RAIM_STREAMING=false の時に使用
+
+async function handleNonStreaming(ws, picked, messages, userMessage, hasImage, ctx) {
+  const { actorId, sessionId, t0, t1 } = ctx;
+
+  // つなぎ言葉（必要時のみ）
+  if (needsHeavyProcessing(userMessage, hasImage)) {
+    const fillerText = pickFiller(hasImage);
+    ws.send(JSON.stringify(createFiller({
+      text: fillerText,
+      emotion: picked.defaultEmotion,
+      intensity: 0.5,
+    })));
+    console.log(`[>>] Filler: ${fillerText}`);
+  }
+
+  // LLM 一括推論
+  const rawLLMOutput = await callLLM(messages);
+  const t2 = Date.now();
+
+  // LLM 応答を chat メッセージに整形
+  const normalized = normalizeLLMOutput(rawLLMOutput);
+
+  console.log(
+    `[>] RAiM: ${normalized.text || normalized.message} ` +
+    `(LLM: ${t2 - t1}ms, total: ${t2 - t0}ms)`
+  );
+
+  // 履歴に記録（chat のみ、error は記録しない）
+  if (normalized.type === 'chat') {
+    const imageDescription = normalized._imageDescription || null;
+    const userContent = buildUserContentWithImage(userMessage, imageDescription);
+
+    await memoryStore.createEvent({
+      actorId,
+      sessionId,
+      payload: [
+        { role: Role.USER, content: { text: userContent } },
+        { role: Role.ASSISTANT, content: { text: normalized.text } },
+      ],
+    });
+
+    if (imageDescription) {
+      console.log(`[+] Image described: "${imageDescription.slice(0, 60)}..."`);
+    }
+  }
+
+  // Flutter に送信（_imageDescription は内部用なので除外）
+  const outputMsg = { ...normalized };
+  delete outputMsg._imageDescription;
+  ws.send(JSON.stringify(outputMsg));
+}
