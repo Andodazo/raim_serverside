@@ -63,10 +63,19 @@
 // ストリーミング ON  → handleStreaming() で 3 段階送信
 // ストリーミング OFF → handleNonStreaming() で chat メッセージ 1 個送信
 
+// 【v7 での変更点】
+// - 起動ログとリクエストログに現在時刻を表示
+// - 動作中の「ライムがどの時間帯として認識してるか」をログで追える
+// - 機能的な変更は prompt-builder.js に集約、server.js は表示のみ
+//
+// 【既存のストリーミング切替機能は維持】
+// RAIM_STREAMING=true (デフォルト): 3段階送信
+// RAIM_STREAMING=false: 従来の chat 一括応答
+
 require('dotenv').config();
 const { WebSocketServer } = require('ws');
 const { callLLM, callLLMStream } = require('./lib/llm');
-const { buildMessages } = require('./lib/prompt-builder');
+const { buildMessages, getTimeContext } = require('./lib/prompt-builder');
 const { pickScene } = require('./lib/pick-scene');
 const {
   MemoryStore,
@@ -97,8 +106,6 @@ const memoryStore = MemoryStore.create();
 const DEFAULT_ACTOR_ID = 'default_user';
 
 // ストリーミング応答の有効化フラグ
-// .env で RAIM_STREAMING=false に設定すると、従来の一括応答に戻る
-// 旧クライアントで動作確認したい時に false にする
 const STREAMING_ENABLED = process.env.RAIM_STREAMING !== 'false';
 
 // ─────────────────────────────────────────────
@@ -134,6 +141,7 @@ function pickFiller(hasImage) {
 const wss = new WebSocketServer({ port: PORT });
 console.log(`\u2713 RAiM local server listening on ws://127.0.0.1:${PORT}`);
 console.log(`  Streaming mode: ${STREAMING_ENABLED ? 'ON' : 'OFF'}`);
+console.log(`  ${getTimeContext()}`);  // ← 起動時刻もログに表示
 
 wss.on('connection', async (ws) => {
   console.log('[+] Client connected');
@@ -188,7 +196,8 @@ wss.on('connection', async (ws) => {
     const imageBase64Array = imageObjects.map(img => img.data);
     const hasImage = imageBase64Array.length > 0;
 
-    console.log(`[<] User: ${userMessage} (session=${sessionId}${hasImage ? `, images=${imageBase64Array.length}` : ''})`);
+    // リクエスト時刻もログに（時刻認識の動作確認用）
+    console.log(`[<] User: ${userMessage} (session=${sessionId}${hasImage ? `, images=${imageBase64Array.length}` : ''}) [${getTimeContext()}]`);
 
     try {
       const t0 = Date.now();
@@ -208,6 +217,7 @@ wss.on('connection', async (ws) => {
       );
 
       // ⑤ プロンプト組立
+      // buildMessages 内で現在時刻が自動的にシステムプロンプトに埋め込まれる
       const messages = buildMessages(
         picked.scene,
         userMessage,
@@ -252,13 +262,10 @@ wss.on('connection', async (ws) => {
 // ─────────────────────────────────────────────
 // ストリーミング応答（A-3 標準モード）
 // ─────────────────────────────────────────────
-//
-// metadata 即時 → text_chunk 順次 → chat_end 完了 の3段階送信
 
 async function handleStreaming(ws, picked, messages, userMessage, hasImage, ctx) {
   const { actorId, sessionId, t0, t1 } = ctx;
 
-  // ⑤-1 metadata を即時送信
   const metadataMsg = createMetadata({
     emotion: picked.defaultEmotion,
     intensity: picked.defaultIntensity,
@@ -267,7 +274,6 @@ async function handleStreaming(ws, picked, messages, userMessage, hasImage, ctx)
   ws.send(JSON.stringify(metadataMsg));
   console.log(`[>] Metadata sent: emotion=${picked.defaultEmotion}, intensity=${picked.defaultIntensity}`);
 
-  // ⑤-2 つなぎ言葉（必要時のみ）
   if (needsHeavyProcessing(userMessage, hasImage)) {
     const fillerText = pickFiller(hasImage);
     ws.send(JSON.stringify(createFiller({
@@ -278,14 +284,12 @@ async function handleStreaming(ws, picked, messages, userMessage, hasImage, ctx)
     console.log(`[>>] Filler: ${fillerText}`);
   }
 
-  // ⑤-3 LLM ストリーミング推論 + チャンク送信
   const extractor = new StreamingTextExtractor();
   let isFirstChunk = true;
   let rawAccumulated = '';
 
   for await (const token of callLLMStream(messages)) {
     rawAccumulated += token;
-
     const chunks = extractor.feed(token);
     for (const chunk of chunks) {
       ws.send(JSON.stringify(createTextChunk({
@@ -306,7 +310,6 @@ async function handleStreaming(ws, picked, messages, userMessage, hasImage, ctx)
 
   const t2 = Date.now();
 
-  // ⑤-4 chat_end で完全な情報を送信
   let finalEmotion = picked.defaultEmotion;
   let finalIntensity = picked.defaultIntensity;
   let fullText = '';
@@ -338,7 +341,6 @@ async function handleStreaming(ws, picked, messages, userMessage, hasImage, ctx)
     `text_len=${fullText.length}, LLM=${t2 - t1}ms, total=${t2 - t0}ms`
   );
 
-  // ⑤-5 履歴に記録
   const userContent = buildUserContentWithImage(userMessage, imageDescription);
   await memoryStore.createEvent({
     actorId,
@@ -357,14 +359,10 @@ async function handleStreaming(ws, picked, messages, userMessage, hasImage, ctx)
 // ─────────────────────────────────────────────
 // 非ストリーミング応答（旧クライアント互換モード）
 // ─────────────────────────────────────────────
-//
-// 従来通り、LLM 推論完了後に chat メッセージ1個を送る
-// .env で RAIM_STREAMING=false の時に使用
 
 async function handleNonStreaming(ws, picked, messages, userMessage, hasImage, ctx) {
   const { actorId, sessionId, t0, t1 } = ctx;
 
-  // つなぎ言葉（必要時のみ）
   if (needsHeavyProcessing(userMessage, hasImage)) {
     const fillerText = pickFiller(hasImage);
     ws.send(JSON.stringify(createFiller({
@@ -375,11 +373,9 @@ async function handleNonStreaming(ws, picked, messages, userMessage, hasImage, c
     console.log(`[>>] Filler: ${fillerText}`);
   }
 
-  // LLM 一括推論
   const rawLLMOutput = await callLLM(messages);
   const t2 = Date.now();
 
-  // LLM 応答を chat メッセージに整形
   const normalized = normalizeLLMOutput(rawLLMOutput);
 
   console.log(
@@ -387,7 +383,6 @@ async function handleNonStreaming(ws, picked, messages, userMessage, hasImage, c
     `(LLM: ${t2 - t1}ms, total: ${t2 - t0}ms)`
   );
 
-  // 履歴に記録（chat のみ、error は記録しない）
   if (normalized.type === 'chat') {
     const imageDescription = normalized._imageDescription || null;
     const userContent = buildUserContentWithImage(userMessage, imageDescription);
@@ -406,7 +401,6 @@ async function handleNonStreaming(ws, picked, messages, userMessage, hasImage, c
     }
   }
 
-  // Flutter に送信（_imageDescription は内部用なので除外）
   const outputMsg = { ...normalized };
   delete outputMsg._imageDescription;
   ws.send(JSON.stringify(outputMsg));
