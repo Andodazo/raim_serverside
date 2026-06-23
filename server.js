@@ -115,6 +115,12 @@
 // - 時刻認識（B-1）
 // - 声プロファイル（B-2、サーバー内部）
 // - TTS サーバー集約（D-2）
+//
+// 【v11 での修正点】
+// - MAX_TOOL_TURNS を 3 → 2 に削減
+// - 同じツール+引数の連続呼出を検知して強制終了
+// - 最終応答強制プロンプトを強化（「ツール結果を活用して答える」を明示）
+// - ツール失敗を検知してプロンプト分岐
 
 require('dotenv').config();
 const { WebSocketServer } = require('ws');
@@ -159,23 +165,15 @@ const {
   validateUpstream,
 } = require('./lib/types');
 
-// ─────────────────────────────────────────────
-// サーバー設定
-// ─────────────────────────────────────────────
-
 const PORT = 8080;
 const memoryStore = MemoryStore.create();
 const DEFAULT_ACTOR_ID = 'default_user';
 const STREAMING_ENABLED = process.env.RAIM_STREAMING !== 'false';
 
-// ツール呼出の最大ターン数（無限ループ防止）
-const MAX_TOOL_TURNS = 3;
+// 最大ツール呼出回数（2回で十分、応答時間と情報量のバランス）
+const MAX_TOOL_TURNS = 2;
 
 loadVoiceConfig();
-
-// ─────────────────────────────────────────────
-// ヘビー処理判定（つなぎ言葉用）
-// ─────────────────────────────────────────────
 
 function needsHeavyProcessing(text, hasImage) {
   if (hasImage) return true;
@@ -199,18 +197,15 @@ function pickFiller(hasImage) {
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
-// ─────────────────────────────────────────────
-// chunk_id 生成
-// ─────────────────────────────────────────────
-
 function makeChunkIdGenerator(sessionId) {
   let counter = 0;
   return () => `${sessionId}_chunk_${counter++}`;
 }
 
-// ─────────────────────────────────────────────
-// 起動
-// ─────────────────────────────────────────────
+// 同じツール+引数の連続呼出を検知するキー生成
+function makeToolCallKey(toolName, args) {
+  return `${toolName}:${JSON.stringify(args)}`;
+}
 
 async function main() {
   const voicevoxOk = await checkVoicevoxAvailable();
@@ -225,8 +220,8 @@ async function main() {
     console.log(`  Voice profile: ${profileInfo.name} (${profileInfo.speaker_name})`);
   }
   console.log(`  Tools: ${TOOL_DEFINITIONS.map(t => t.function.name).join(', ')}`);
+  console.log(`  Max tool turns: ${MAX_TOOL_TURNS}`);
 
-  // ツール用環境変数チェック
   if (!process.env.TAVILY_API_KEY) {
     console.warn('  ⚠ TAVILY_API_KEY not set, web_search will fail');
   }
@@ -253,7 +248,6 @@ async function main() {
     console.log(`[~] Session started: ${sessionId}`);
 
     ws.on('message', async (rawData) => {
-
       let parsed;
       try {
         parsed = JSON.parse(rawData.toString());
@@ -301,12 +295,10 @@ async function main() {
           `history=${history.length} turns, hasImage=${hasImage})`
         );
 
-        // ツール使用フローに統合
         await handleRequest(ws, picked, userMessage, hasImage, imageBase64Array, history, {
           actorId, sessionId, t0, t1,
           ttsEnabled: connectionContext.ttsEnabled,
         });
-
       } catch (err) {
         console.error('[!] Error:', err.message);
         console.error(err.stack);
@@ -334,15 +326,10 @@ async function main() {
   });
 }
 
-// ─────────────────────────────────────────────
-// メイン処理：ツール判定 → 必要なら実行 → ストリーミング応答
-// ─────────────────────────────────────────────
-
 async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array, history, ctx) {
   const { actorId, sessionId, t0, t1, ttsEnabled } = ctx;
   const nextChunkId = makeChunkIdGenerator(sessionId);
 
-  // metadata 送信（即時、emotion 先送り）
   ws.send(JSON.stringify(createMetadata({
     emotion: picked.defaultEmotion,
     intensity: picked.defaultIntensity,
@@ -350,7 +337,6 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
   })));
   console.log(`[>] Metadata sent: emotion=${picked.defaultEmotion}, intensity=${picked.defaultIntensity}`);
 
-  // ツール用 messages を構築（withTools=true）
   let messages = buildMessages(
     picked.scene,
     userMessage,
@@ -359,34 +345,53 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
     { withTools: true }
   );
 
-  // ツール呼出ループ（最大 MAX_TOOL_TURNS まで）
   let toolTurn = 0;
   let imageDescription = null;
   let finalText = '';
   let finalEmotion = picked.defaultEmotion;
   let finalIntensity = picked.defaultIntensity;
+  let toolError = false;
+  let exitedDueToDuplicate = false;
+  const seenToolCalls = new Set();
 
   while (toolTurn < MAX_TOOL_TURNS) {
     toolTurn++;
     console.log(`[Tool Loop] Turn ${toolTurn}/${MAX_TOOL_TURNS}`);
 
-    // LLM 呼出（tools 付き、stream:false）
     const llmResult = await callLLMWithTools(messages, TOOL_DEFINITIONS);
 
     if (llmResult.thinking) {
-      // 思考プロセスはサーバーログのみ、クライアントには送らない
       console.log(`  [Thinking] ${llmResult.thinking.slice(0, 200).replace(/\n/g, ' ')}...`);
     }
 
-    // tool_calls が返ってきたか判定
     if (llmResult.tool_calls && llmResult.tool_calls.length > 0) {
-      // ─── ツール呼出ルート ───
       console.log(`  [Tool Calls] ${llmResult.tool_calls.length} tool(s) requested`);
+
+      // 重複検知
+      let hasDuplicate = false;
+      for (const toolCall of llmResult.tool_calls) {
+        const toolName = toolCall.function.name;
+        let toolArgs = toolCall.function.arguments;
+        if (typeof toolArgs === 'string') {
+          try {
+            toolArgs = JSON.parse(toolArgs);
+          } catch {
+            toolArgs = {};
+          }
+        }
+        const key = makeToolCallKey(toolName, toolArgs);
+        if (seenToolCalls.has(key)) {
+          console.warn(`  [!] Duplicate tool call detected: ${key}, forcing final response`);
+          hasDuplicate = true;
+          exitedDueToDuplicate = true;
+          break;
+        }
+      }
+      if (hasDuplicate) break;
 
       for (const toolCall of llmResult.tool_calls) {
         const toolName = toolCall.function.name;
         let toolArgs = toolCall.function.arguments;
-        // arguments が文字列の場合は parse（Ollama / Bedrock で形式違う可能性あり）
         if (typeof toolArgs === 'string') {
           try {
             toolArgs = JSON.parse(toolArgs);
@@ -396,7 +401,8 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
           }
         }
 
-        // 1. 固定セリフを送信（ライムが「調べるね」と喋る）
+        seenToolCalls.add(makeToolCallKey(toolName, toolArgs));
+
         const introText = pickToolIntro(toolName, toolTurn);
         const introChunkId = nextChunkId();
         ws.send(JSON.stringify(createTextChunk({
@@ -406,14 +412,12 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
         })));
         console.log(`  [Intro] ${introText}`);
 
-        // TTS で音声生成・送信（非同期、待たない）
         if (ttsEnabled) {
           const voiceParams = getVoiceParams(picked.defaultEmotion, 0.6);
           synthesizeAndSend(ws, introChunkId, introText, voiceParams)
             .catch(err => console.warn(`  [TTS] Intro error: ${err.message}`));
         }
 
-        // 2. tool_call メッセージ送信（Flutter UI 表示用）
         ws.send(JSON.stringify(createToolCall({
           tool: toolName,
           description: getToolDescription(toolName, toolArgs),
@@ -421,11 +425,13 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
         })));
         console.log(`  [>] tool_call: ${toolName}`);
 
-        // 3. ツール実行
         const toolResult = await executeTool(toolName, toolArgs);
 
-        // 4. messages に追加（LLM が次に判断できるように）
-        // 形式: assistant.tool_calls → tool.content
+        if (toolResult && toolResult.error) {
+          toolError = true;
+          console.warn(`  [!] Tool returned error: ${toolResult.message}`);
+        }
+
         messages.push({
           role: 'assistant',
           content: '',
@@ -438,14 +444,12 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
         });
       }
 
-      // ツール実行後、ループ継続して次の LLM 判断へ
       continue;
     }
 
-    // ─── 通常応答ルート（tool_calls なし） ───
+    // ツールなし通常応答
     console.log(`  [No tool] LLM returned normal response`);
 
-    // LLM の content を JSON としてパース
     const content = llmResult.content || '';
     try {
       const cleaned = content
@@ -460,23 +464,26 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
       if (typeof parsed.intensity === 'number') finalIntensity = parsed.intensity;
       if (parsed.image_description) imageDescription = parsed.image_description;
     } catch (e) {
-      // パース失敗：content をそのままテキストとして扱う
-      console.warn(`  [!] Failed to parse LLM JSON: ${e.message}`);
+      console.warn(`  [!] Failed to parse LLM JSON: ${e.message}, content="${content.slice(0, 200)}"`);
       finalText = content;
     }
-
-    // ツールルートを抜けてストリーミング応答へ
     break;
   }
 
-  // MAX_TOOL_TURNS 到達時：強制的にツールなしで最終応答生成
-  if (toolTurn >= MAX_TOOL_TURNS && finalText === '') {
-    console.log(`  [!] Max tool turns reached, forcing final response`);
-    // ツールなしの最終応答用 messages を作る
-    // 既存の messages を流用、最後に「以上の情報を踏まえてユーザーに答えて」と追加
+  // 強制応答
+  if (finalText === '') {
+    const reason = exitedDueToDuplicate
+      ? '同じツールの重複呼出を防ぐため'
+      : `最大ターン数(${MAX_TOOL_TURNS})に到達したため`;
+    console.log(`  [!] Forcing final response (${reason})`);
+
+    const forcePrompt = toolError
+      ? '上記でいくつかツールを実行しました。一部失敗もありますが、得られた情報を踏まえて、ユーザーへの最終応答を生成してください。ツールはこれ以上使わず、tool ロールで返ってきた情報を活用して答えてください。応答はライムキャラのまま、必ず以下のJSON形式で: {"type":"chat","text":"...","emotion":"happy/sad/angry/surprised/neutral/caring","intensity":0.0-1.0}'
+      : '上記のツール実行結果（tool ロールの content）を踏まえて、ユーザーへの最終応答を生成してください。ツールはこれ以上使わず、ツール結果の情報を活用して、ユーザーの質問に具体的に答えてください。応答はライムキャラのまま、必ず以下のJSON形式で: {"type":"chat","text":"...","emotion":"happy/sad/angry/surprised/neutral/caring","intensity":0.0-1.0}';
+
     messages.push({
       role: 'user',
-      content: 'これまでの情報を踏まえて、簡潔に答えてください。これ以上ツールは使わないこと。',
+      content: forcePrompt,
     });
 
     const finalLlmResult = await callLLM(messages);
@@ -491,18 +498,16 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
       if (parsed.emotion) finalEmotion = parsed.emotion;
       if (typeof parsed.intensity === 'number') finalIntensity = parsed.intensity;
     } catch (e) {
+      console.warn(`  [!] Final force-response parse failed: ${e.message}`);
       finalText = finalLlmResult;
     }
   }
 
-  // ─── 最終応答を text_chunk + audio_chunk で送信 ───
-  // ストリーミングらしく見せるため、句単位で分割して送信する
   await sendFinalResponseAsChunks(
     ws, finalText, finalEmotion, finalIntensity,
-    nextChunkId, ttsEnabled, toolTurn === 1
+    nextChunkId, ttsEnabled, toolTurn === 0
   );
 
-  // chat_end 送信
   ws.send(JSON.stringify(createChatEnd({
     fullText: finalText,
     emotion: finalEmotion,
@@ -512,11 +517,10 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
   const t2 = Date.now();
   console.log(
     `[>] chat_end: emotion=${finalEmotion}, intensity=${finalIntensity}, ` +
-    `text_len=${finalText.length}, toolTurns=${toolTurn - (toolTurn > 0 && finalText !== '' ? 1 : 0)}, ` +
+    `text_len=${finalText.length}, toolTurns=${seenToolCalls.size}, ` +
     `total=${t2 - t0}ms`
   );
 
-  // 履歴に記録
   const userContent = buildUserContentWithImage(userMessage, imageDescription);
   await memoryStore.createEvent({
     actorId,
@@ -532,17 +536,10 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
   }
 }
 
-// ─────────────────────────────────────────────
-// 最終応答を句単位で text_chunk + audio_chunk として送信
-// ─────────────────────────────────────────────
-
 async function sendFinalResponseAsChunks(ws, fullText, emotion, intensity, nextChunkId, ttsEnabled, isFirst) {
   if (!fullText || fullText.length === 0) return;
 
-  // 句読点で分割（句読点を含めて）
-  // 例: "お疲れ様、無理しないでね。" → ["お疲れ様、", "無理しないでね。"]
   const chunks = splitIntoChunks(fullText);
-
   const ttsPromises = [];
   const voiceParams = ttsEnabled ? getVoiceParams(emotion, intensity) : null;
 
@@ -551,14 +548,12 @@ async function sendFinalResponseAsChunks(ws, fullText, emotion, intensity, nextC
     const chunkId = nextChunkId();
     const isFirstChunk = isFirst && i === 0;
 
-    // text_chunk 送信
     ws.send(JSON.stringify(createTextChunk({
       text: chunk,
       chunkId,
       isFirst: isFirstChunk,
     })));
 
-    // audio_chunk を非同期で生成・送信
     if (ttsEnabled && voiceParams) {
       const promise = synthesizeAndSend(ws, chunkId, chunk, voiceParams)
         .catch(err => console.warn(`[!] TTS error for ${chunkId}: ${err.message}`));
@@ -566,7 +561,6 @@ async function sendFinalResponseAsChunks(ws, fullText, emotion, intensity, nextC
     }
   }
 
-  // 全 TTS 完了を待つ（タイムアウト 15秒）
   if (ttsPromises.length > 0) {
     await Promise.race([
       Promise.allSettled(ttsPromises),
@@ -575,10 +569,6 @@ async function sendFinalResponseAsChunks(ws, fullText, emotion, intensity, nextC
   }
 }
 
-/**
- * テキストを句単位で分割
- * 句読点（、。！？\n）の後で区切る、または最大30文字
- */
 function splitIntoChunks(text) {
   const chunks = [];
   let current = '';
@@ -597,10 +587,6 @@ function splitIntoChunks(text) {
   }
   return chunks;
 }
-
-// ─────────────────────────────────────────────
-// TTS 合成・送信ヘルパ
-// ─────────────────────────────────────────────
 
 async function synthesizeAndSend(ws, chunkId, text, voiceParams) {
   const t0 = Date.now();
@@ -622,7 +608,6 @@ async function synthesizeAndSend(ws, chunkId, text, voiceParams) {
   );
 }
 
-// サーバー起動
 main().catch(err => {
   console.error('[FATAL] Server startup failed:', err);
   process.exit(1);
