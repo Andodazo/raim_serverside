@@ -122,6 +122,19 @@
 // - 最終応答強制プロンプトを強化（「ツール結果を活用して答える」を明示）
 // - ツール失敗を検知してプロンプト分岐
 
+// 【v12 での変更点】
+// - filler_audio メッセージを廃止（text_chunk + is_filler:true で代替）
+// - emotions オブジェクト形式に対応（複数感情）
+// - emotion + intensity は後方互換用に維持（types.js が自動算出）
+// - シーンの default_emotion → default_emotions （後方互換あり）
+//
+// 【既存機能は維持】
+// - A-3 ストリーミング応答
+// - D-2 TTS サーバー集約
+// - B-1 時刻認識
+// - C-1 Function Calling
+// - マルチモーダル
+
 require('dotenv').config();
 const { WebSocketServer } = require('ws');
 const { callLLM, callLLMStream, callLLMWithTools } = require('./lib/llm');
@@ -133,10 +146,9 @@ const {
   eventsToMessages,
   buildUserContentWithImage,
 } = require('./lib/memory-store');
-const { StreamingTextExtractor } = require('./lib/streaming-parser');
 const {
   loadVoiceConfig,
-  getVoiceParams,
+  getVoiceParamsFromEmotions,
   getActiveProfileInfo,
 } = require('./lib/voice-mapper');
 const {
@@ -153,7 +165,6 @@ const {
 const {
   EMOTIONS,
   ERROR_CODES,
-  createFiller,
   createError,
   createSessionStart,
   createMetadata,
@@ -161,19 +172,23 @@ const {
   createAudioChunk,
   createChatEnd,
   createToolCall,
-  normalizeLLMOutput,
   validateUpstream,
+  getDominantEmotion,
+  emotionToEmotions,
+  normalizeEmotions,
 } = require('./lib/types');
 
 const PORT = 8080;
 const memoryStore = MemoryStore.create();
 const DEFAULT_ACTOR_ID = 'default_user';
 const STREAMING_ENABLED = process.env.RAIM_STREAMING !== 'false';
-
-// 最大ツール呼出回数（2回で十分、応答時間と情報量のバランス）
 const MAX_TOOL_TURNS = 2;
 
 loadVoiceConfig();
+
+// ─────────────────────────────────────────────
+// ヘビー処理判定（つなぎ言葉用）
+// ─────────────────────────────────────────────
 
 function needsHeavyProcessing(text, hasImage) {
   if (hasImage) return true;
@@ -202,10 +217,26 @@ function makeChunkIdGenerator(sessionId) {
   return () => `${sessionId}_chunk_${counter++}`;
 }
 
-// 同じツール+引数の連続呼出を検知するキー生成
 function makeToolCallKey(toolName, args) {
   return `${toolName}:${JSON.stringify(args)}`;
 }
+
+// ─────────────────────────────────────────────
+// シーンの default_emotions を取得
+// シーン定義が新形式（default_emotions）でも旧形式（default_emotion + default_intensity）でも対応
+// ─────────────────────────────────────────────
+
+function getSceneDefaultEmotions(picked) {
+  if (picked.defaultEmotions) {
+    return picked.defaultEmotions;
+  }
+  // 旧形式 → 新形式へ変換
+  return emotionToEmotions(picked.defaultEmotion, picked.defaultIntensity);
+}
+
+// ─────────────────────────────────────────────
+// 起動
+// ─────────────────────────────────────────────
 
 async function main() {
   const voicevoxOk = await checkVoicevoxAvailable();
@@ -221,6 +252,7 @@ async function main() {
   }
   console.log(`  Tools: ${TOOL_DEFINITIONS.map(t => t.function.name).join(', ')}`);
   console.log(`  Max tool turns: ${MAX_TOOL_TURNS}`);
+  console.log(`  Emotions format: multi-emotion (v12)`);
 
   if (!process.env.TAVILY_API_KEY) {
     console.warn('  ⚠ TAVILY_API_KEY not set, web_search will fail');
@@ -326,17 +358,46 @@ async function main() {
   });
 }
 
+// ─────────────────────────────────────────────
+// メイン処理
+// ─────────────────────────────────────────────
+
 async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array, history, ctx) {
   const { actorId, sessionId, t0, t1, ttsEnabled } = ctx;
   const nextChunkId = makeChunkIdGenerator(sessionId);
 
+  // シーンから default_emotions 取得
+  const defaultEmotions = getSceneDefaultEmotions(picked);
+
+  // metadata 送信（即時、emotion 先送り）
   ws.send(JSON.stringify(createMetadata({
-    emotion: picked.defaultEmotion,
-    intensity: picked.defaultIntensity,
+    emotions: defaultEmotions,
     sceneId: picked.scene.id,
   })));
-  console.log(`[>] Metadata sent: emotion=${picked.defaultEmotion}, intensity=${picked.defaultIntensity}`);
+  const dom = getDominantEmotion(defaultEmotions);
+  console.log(`[>] Metadata sent: emotions=${JSON.stringify(defaultEmotions)}, dominant=${dom.emotion}`);
 
+  // つなぎ言葉（v12: filler_audio タイプ廃止、text_chunk + is_filler:true で送信）
+  if (needsHeavyProcessing(userMessage, hasImage)) {
+    const fillerText = pickFiller(hasImage);
+    const fillerChunkId = nextChunkId();
+
+    ws.send(JSON.stringify(createTextChunk({
+      text: fillerText,
+      chunkId: fillerChunkId,
+      isFirst: true,
+      isFiller: true,
+    })));
+    console.log(`[>>] Filler (as text_chunk with is_filler): ${fillerText}`);
+
+    if (ttsEnabled) {
+      const fillerVoiceParams = getVoiceParamsFromEmotions(defaultEmotions);
+      synthesizeAndSend(ws, fillerChunkId, fillerText, fillerVoiceParams)
+        .catch(err => console.warn(`[!] Filler TTS error: ${err.message}`));
+    }
+  }
+
+  // ツール用 messages
   let messages = buildMessages(
     picked.scene,
     userMessage,
@@ -348,8 +409,7 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
   let toolTurn = 0;
   let imageDescription = null;
   let finalText = '';
-  let finalEmotion = picked.defaultEmotion;
-  let finalIntensity = picked.defaultIntensity;
+  let finalEmotions = defaultEmotions;
   let toolError = false;
   let exitedDueToDuplicate = false;
   const seenToolCalls = new Set();
@@ -373,15 +433,11 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
         const toolName = toolCall.function.name;
         let toolArgs = toolCall.function.arguments;
         if (typeof toolArgs === 'string') {
-          try {
-            toolArgs = JSON.parse(toolArgs);
-          } catch {
-            toolArgs = {};
-          }
+          try { toolArgs = JSON.parse(toolArgs); } catch { toolArgs = {}; }
         }
         const key = makeToolCallKey(toolName, toolArgs);
         if (seenToolCalls.has(key)) {
-          console.warn(`  [!] Duplicate tool call detected: ${key}, forcing final response`);
+          console.warn(`  [!] Duplicate tool call detected: ${key}`);
           hasDuplicate = true;
           exitedDueToDuplicate = true;
           break;
@@ -393,16 +449,12 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
         const toolName = toolCall.function.name;
         let toolArgs = toolCall.function.arguments;
         if (typeof toolArgs === 'string') {
-          try {
-            toolArgs = JSON.parse(toolArgs);
-          } catch (e) {
-            console.warn(`  [Tool] Failed to parse arguments: ${toolArgs}`);
-            toolArgs = {};
-          }
+          try { toolArgs = JSON.parse(toolArgs); } catch { toolArgs = {}; }
         }
 
         seenToolCalls.add(makeToolCallKey(toolName, toolArgs));
 
+        // 前置きセリフ（filler ではない、ライムの発話として）
         const introText = pickToolIntro(toolName, toolTurn);
         const introChunkId = nextChunkId();
         ws.send(JSON.stringify(createTextChunk({
@@ -413,11 +465,12 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
         console.log(`  [Intro] ${introText}`);
 
         if (ttsEnabled) {
-          const voiceParams = getVoiceParams(picked.defaultEmotion, 0.6);
+          const voiceParams = getVoiceParamsFromEmotions(defaultEmotions);
           synthesizeAndSend(ws, introChunkId, introText, voiceParams)
             .catch(err => console.warn(`  [TTS] Intro error: ${err.message}`));
         }
 
+        // tool_call 通知
         ws.send(JSON.stringify(createToolCall({
           tool: toolName,
           description: getToolDescription(toolName, toolArgs),
@@ -425,6 +478,7 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
         })));
         console.log(`  [>] tool_call: ${toolName}`);
 
+        // ツール実行
         const toolResult = await executeTool(toolName, toolArgs);
 
         if (toolResult && toolResult.error) {
@@ -449,7 +503,6 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
 
     // ツールなし通常応答
     console.log(`  [No tool] LLM returned normal response`);
-
     const content = llmResult.content || '';
     try {
       const cleaned = content
@@ -460,8 +513,15 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
       const parsed = JSON.parse(cleaned);
 
       finalText = parsed.text || '';
-      if (parsed.emotion) finalEmotion = parsed.emotion;
-      if (typeof parsed.intensity === 'number') finalIntensity = parsed.intensity;
+
+      // emotions 優先、なければ emotion + intensity から作る
+      const parsedEmotions = normalizeEmotions(parsed.emotions);
+      if (parsedEmotions) {
+        finalEmotions = parsedEmotions;
+      } else if (parsed.emotion) {
+        finalEmotions = emotionToEmotions(parsed.emotion, parsed.intensity);
+      }
+
       if (parsed.image_description) imageDescription = parsed.image_description;
     } catch (e) {
       console.warn(`  [!] Failed to parse LLM JSON: ${e.message}, content="${content.slice(0, 200)}"`);
@@ -478,8 +538,8 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
     console.log(`  [!] Forcing final response (${reason})`);
 
     const forcePrompt = toolError
-      ? '上記でいくつかツールを実行しました。一部失敗もありますが、得られた情報を踏まえて、ユーザーへの最終応答を生成してください。ツールはこれ以上使わず、tool ロールで返ってきた情報を活用して答えてください。応答はライムキャラのまま、必ず以下のJSON形式で: {"type":"chat","text":"...","emotion":"happy/sad/angry/surprised/neutral/caring","intensity":0.0-1.0}'
-      : '上記のツール実行結果（tool ロールの content）を踏まえて、ユーザーへの最終応答を生成してください。ツールはこれ以上使わず、ツール結果の情報を活用して、ユーザーの質問に具体的に答えてください。応答はライムキャラのまま、必ず以下のJSON形式で: {"type":"chat","text":"...","emotion":"happy/sad/angry/surprised/neutral/caring","intensity":0.0-1.0}';
+      ? '上記でいくつかツールを実行しました。一部失敗もありますが、得られた情報を踏まえて、ユーザーへの最終応答を生成してください。ツールはこれ以上使わず、tool ロールで返ってきた情報を活用して答えてください。応答はライムキャラのまま、JSON形式 {"type":"chat","text":"...","emotions":{"感情名":強さ,...}} で。'
+      : '上記のツール実行結果（tool ロールの content）を踏まえて、ユーザーへの最終応答を生成してください。ツールはこれ以上使わず、ツール結果の情報を活用して、ユーザーの質問に具体的に答えてください。応答はライムキャラのまま、JSON形式 {"type":"chat","text":"...","emotions":{"感情名":強さ,...}} で。';
 
     messages.push({
       role: 'user',
@@ -495,32 +555,40 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
         .trim();
       const parsed = JSON.parse(cleaned);
       finalText = parsed.text || finalLlmResult;
-      if (parsed.emotion) finalEmotion = parsed.emotion;
-      if (typeof parsed.intensity === 'number') finalIntensity = parsed.intensity;
+
+      const parsedEmotions = normalizeEmotions(parsed.emotions);
+      if (parsedEmotions) {
+        finalEmotions = parsedEmotions;
+      } else if (parsed.emotion) {
+        finalEmotions = emotionToEmotions(parsed.emotion, parsed.intensity);
+      }
     } catch (e) {
       console.warn(`  [!] Final force-response parse failed: ${e.message}`);
       finalText = finalLlmResult;
     }
   }
 
+  // 最終応答送信
   await sendFinalResponseAsChunks(
-    ws, finalText, finalEmotion, finalIntensity,
+    ws, finalText, finalEmotions,
     nextChunkId, ttsEnabled, toolTurn === 0
   );
 
+  // chat_end
   ws.send(JSON.stringify(createChatEnd({
     fullText: finalText,
-    emotion: finalEmotion,
-    intensity: finalIntensity,
+    emotions: finalEmotions,
   })));
 
   const t2 = Date.now();
+  const finalDom = getDominantEmotion(finalEmotions);
   console.log(
-    `[>] chat_end: emotion=${finalEmotion}, intensity=${finalIntensity}, ` +
+    `[>] chat_end: emotions=${JSON.stringify(finalEmotions)}, dominant=${finalDom.emotion}, ` +
     `text_len=${finalText.length}, toolTurns=${seenToolCalls.size}, ` +
     `total=${t2 - t0}ms`
   );
 
+  // 履歴記録
   const userContent = buildUserContentWithImage(userMessage, imageDescription);
   await memoryStore.createEvent({
     actorId,
@@ -536,12 +604,16 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
   }
 }
 
-async function sendFinalResponseAsChunks(ws, fullText, emotion, intensity, nextChunkId, ttsEnabled, isFirst) {
+// ─────────────────────────────────────────────
+// 句単位送信
+// ─────────────────────────────────────────────
+
+async function sendFinalResponseAsChunks(ws, fullText, emotions, nextChunkId, ttsEnabled, isFirst) {
   if (!fullText || fullText.length === 0) return;
 
   const chunks = splitIntoChunks(fullText);
   const ttsPromises = [];
-  const voiceParams = ttsEnabled ? getVoiceParams(emotion, intensity) : null;
+  const voiceParams = ttsEnabled ? getVoiceParamsFromEmotions(emotions) : null;
 
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
@@ -587,6 +659,10 @@ function splitIntoChunks(text) {
   }
   return chunks;
 }
+
+// ─────────────────────────────────────────────
+// TTS 合成・送信
+// ─────────────────────────────────────────────
 
 async function synthesizeAndSend(ws, chunkId, text, voiceParams) {
   const t0 = Date.now();
