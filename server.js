@@ -140,6 +140,26 @@
 // - emotions を合計1.0 に正規化、overall_intensity を別途算出
 // - voice-mapper への入力を emotions + overall_intensity に統一
 // - シーン default_emotions も新感情を活用可能に
+// server.js
+// ==============================================================================
+// RAiM 中継サーバー：v14（filler 廃止 + audio 順序保証 + bubble_break 対応版）
+// ==============================================================================
+//
+// 【v14 での変更点】
+// 1. needsHeavyProcessing の filler 廃止
+//    → ツール使用時は tool intro で「調べるね」と言えば十分、二重発話を防ぐ
+//    → ツール不要のヘビー処理（画像認識のみ等）でも、metadata で emotion 先送りしてるので
+//      ユーザー体感上「待たされてる感」は既に緩和されている
+//
+// 2. audio_chunk の順序保証
+//    → 並列 TTS 合成は維持（速度のため）
+//    → 送信は Promise.all + 順次 await で chunk_id 順を保証
+//    → Flutter 側の AudioPlayQueue が届いた順に再生するため、送信順=再生順にする
+//
+// 3. tool intro 後に bubble_break 送信
+//    → Flutter は bubble_break を受けたら _currentStreamingMessage をリセット
+//    → 次の text_chunk（本文）は別の吹き出しとして表示される
+//    → intro と本文が同じ吹き出しに繋がる問題を解消
 
 require('dotenv').config();
 const { WebSocketServer } = require('ws');
@@ -179,6 +199,7 @@ const {
   createAudioChunk,
   createChatEnd,
   createToolCall,
+  createBubbleBreak,
   validateUpstream,
   sanitizeEmotions,
   normalizeAndComputeIntensity,
@@ -195,27 +216,9 @@ const MAX_TOOL_TURNS = 2;
 
 loadVoiceConfig();
 
-function needsHeavyProcessing(text, hasImage) {
-  if (hasImage) return true;
-  return /(天気|ニュース|調べて|教えて|検索|何時|今いつ)/.test(text);
-}
-
-const FILLER_PHRASES = [
-  'んー、ちょっと待ってね……',
-  'えっと、それね……',
-  'あ、それ気になる。少し待って？',
-];
-
-const FILLER_PHRASES_IMAGE = [
-  'えっ、何これ？……',
-  'うわ、面白そう。',
-  '画像？ふふ、見てみるね……',
-];
-
-function pickFiller(hasImage) {
-  const pool = hasImage ? FILLER_PHRASES_IMAGE : FILLER_PHRASES;
-  return pool[Math.floor(Math.random() * pool.length)];
-}
+// v14: needsHeavyProcessing の filler ロジック廃止
+// ツール使う時は tool_intro で十分、ツール不要時は metadata の emotion 先送りで
+// 「待たされてる感」は既に緩和されてる
 
 function makeChunkIdGenerator(sessionId) {
   let counter = 0;
@@ -226,10 +229,6 @@ function makeToolCallKey(toolName, args) {
   return `${toolName}:${JSON.stringify(args)}`;
 }
 
-/**
- * シーンの default_emotions を取得
- * 新形式（default_emotions）/ 旧形式（default_emotion + default_intensity）両対応
- */
 function getSceneDefaultEmotions(picked) {
   if (picked.defaultEmotions) {
     return picked.defaultEmotions;
@@ -251,7 +250,8 @@ async function main() {
   }
   console.log(`  Tools: ${TOOL_DEFINITIONS.map(t => t.function.name).join(', ')}`);
   console.log(`  Max tool turns: ${MAX_TOOL_TURNS}`);
-  console.log(`  Emotions: ${ALL_EMOTIONS.length} types (normalized + overall_intensity, v13)`);
+  console.log(`  Emotions: ${ALL_EMOTIONS.length} types (normalized + overall_intensity)`);
+  console.log(`  Protocol: v14 (bubble_break support, ordered audio_chunk)`);
 
   if (!process.env.TAVILY_API_KEY) {
     console.warn('  ⚠ TAVILY_API_KEY not set, web_search will fail');
@@ -362,10 +362,8 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
   const nextChunkId = makeChunkIdGenerator(sessionId);
 
   const rawDefaultEmotions = getSceneDefaultEmotions(picked);
-  // metadata 用に正規化
   const metaResolved = resolveEmotionsInput({ emotions: rawDefaultEmotions });
 
-  // metadata 送信
   ws.send(JSON.stringify(createMetadata({
     emotions: rawDefaultEmotions,
     sceneId: picked.scene.id,
@@ -375,26 +373,7 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
     `overall=${metaResolved.overall_intensity}, dominant=${metaResolved.emotion}`
   );
 
-  // つなぎ言葉
-  if (needsHeavyProcessing(userMessage, hasImage)) {
-    const fillerText = pickFiller(hasImage);
-    const fillerChunkId = nextChunkId();
-
-    ws.send(JSON.stringify(createTextChunk({
-      text: fillerText,
-      chunkId: fillerChunkId,
-      isFirst: true,
-      isFiller: true,
-    })));
-    console.log(`[>>] Filler (text_chunk with is_filler): ${fillerText}`);
-
-    if (ttsEnabled) {
-      // つなぎ言葉は overall_intensity を 0.6 に固定（控えめ）
-      const fillerVoiceParams = getVoiceParamsFromEmotions(metaResolved.emotions, 0.6);
-      synthesizeAndSend(ws, fillerChunkId, fillerText, fillerVoiceParams)
-        .catch(err => console.warn(`[!] Filler TTS error: ${err.message}`));
-    }
-  }
+  // v14: needsHeavyProcessing の filler は廃止した（削除済み）
 
   let messages = buildMessages(
     picked.scene,
@@ -410,6 +389,7 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
   let finalRawEmotions = rawDefaultEmotions;
   let toolError = false;
   let exitedDueToDuplicate = false;
+  let hasSentIntro = false;  // v14: intro を送ったかどうか（bubble_break 送信判定に使う）
   const seenToolCalls = new Set();
 
   while (toolTurn < MAX_TOOL_TURNS) {
@@ -446,11 +426,16 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
         const toolName = toolCall.function.name;
         let toolArgs = toolCall.function.arguments;
         if (typeof toolArgs === 'string') {
-          try { toolArgs = JSON.parse(toolArgs); } catch { toolArgs = {}; }
+          try { toolArgs = JSON.parse(toolArgs); } catch (e) {
+            console.warn(`  [Tool] Failed to parse arguments: ${toolArgs}`);
+            toolArgs = {};
+          }
         }
 
         seenToolCalls.add(makeToolCallKey(toolName, toolArgs));
 
+        // Tool intro を text_chunk + audio_chunk で送信
+        // audio は TTS 合成完了を待って直後に送信（1個だけなので順序問題なし）
         const introText = pickToolIntro(toolName, toolTurn);
         const introChunkId = nextChunkId();
         ws.send(JSON.stringify(createTextChunk({
@@ -465,6 +450,8 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
           synthesizeAndSend(ws, introChunkId, introText, voiceParams)
             .catch(err => console.warn(`  [TTS] Intro error: ${err.message}`));
         }
+
+        hasSentIntro = true;  // v14: intro 送ったフラグ
 
         ws.send(JSON.stringify(createToolCall({
           tool: toolName,
@@ -508,7 +495,6 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
 
       finalText = parsed.text || '';
 
-      // emotions 優先、なければ emotion + intensity から生成
       const parsedEmotions = sanitizeEmotions(parsed.emotions);
       if (parsedEmotions) {
         finalRawEmotions = parsedEmotions;
@@ -562,16 +548,23 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
     }
   }
 
-  // 最終応答の emotions を正規化（送信時のため、ログ用にも）
   const finalResolved = resolveEmotionsInput({ emotions: finalRawEmotions });
 
+  // v14: intro を送ってた場合、本文の前に bubble_break を送信
+  // Flutter は bubble_break を受けたら _currentStreamingMessage をリセットして、
+  // 次の text_chunk を新規メッセージとして扱う
+  if (hasSentIntro) {
+    ws.send(JSON.stringify(createBubbleBreak()));
+    console.log(`  [>] bubble_break sent (intro was sent, separating from body)`);
+  }
+
+  // 最終応答を text_chunk + audio_chunk（順序保証）で送信
   await sendFinalResponseAsChunks(
     ws, finalText,
     finalResolved.emotions, finalResolved.overall_intensity,
-    nextChunkId, ttsEnabled, toolTurn === 0
+    nextChunkId, ttsEnabled, !hasSentIntro
   );
 
-  // chat_end 送信（raw を渡せば createChatEnd が正規化してくれる）
   ws.send(JSON.stringify(createChatEnd({
     fullText: finalText,
     emotions: finalRawEmotions,
@@ -600,38 +593,85 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
   }
 }
 
+/**
+ * v14: 最終応答を text_chunk + audio_chunk で送信、audio は順序保証
+ *
+ * 【設計】
+ * - text_chunk は for ループで即送信（順番通り）
+ * - TTS 合成は Promise.all で並列実行（速度のため）
+ * - audio_chunk 送信は await ttsPromises[i] で直列化（順序のため）
+ *
+ * 【なぜ順序保証必要か】
+ * v13 までは合成完了順に送っていたため、短い chunk が先に到着 → 音声が滅茶苦茶な順序で再生されてた。
+ * Flutter の AudioPlayQueue は届いた順に再生する仕様なので、サーバー側で送信順=再生順にする。
+ *
+ * 【なぜ並列合成を維持】
+ * chunk ごとに順次 TTS 待つと合計時間が (合成時間 × chunk数) になる。並列なら (最大合成時間) で済む。
+ */
 async function sendFinalResponseAsChunks(ws, fullText, normalizedEmotions, overallIntensity, nextChunkId, ttsEnabled, isFirst) {
   if (!fullText || fullText.length === 0) return;
 
   const chunks = splitIntoChunks(fullText);
-  const ttsPromises = [];
   const voiceParams = ttsEnabled
     ? getVoiceParamsFromEmotions(normalizedEmotions, overallIntensity)
     : null;
 
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
+  // chunk ごとに chunk_id を割り当てて、TTS 合成を並列で開始
+  // Promise を配列に貯めて、後で順次 await する
+  const chunkInfos = chunks.map((chunk, i) => {
     const chunkId = nextChunkId();
     const isFirstChunk = isFirst && i === 0;
 
+    // text_chunk は即送信（順番通り、text は速く出したい）
     ws.send(JSON.stringify(createTextChunk({
       text: chunk,
       chunkId,
       isFirst: isFirstChunk,
     })));
 
-    if (ttsEnabled && voiceParams) {
-      const promise = synthesizeAndSend(ws, chunkId, chunk, voiceParams)
-        .catch(err => console.warn(`[!] TTS error for ${chunkId}: ${err.message}`));
-      ttsPromises.push(promise);
-    }
-  }
+    // TTS 合成を非同期で開始（並列）
+    // ここで await しない、Promise を返すだけ
+    const ttsPromise = ttsEnabled && voiceParams
+      ? synthesize(chunk, voiceParams)
+          .then(wavBuffer => ({ chunkId, chunk, wavBuffer, error: null }))
+          .catch(err => ({ chunkId, chunk, wavBuffer: null, error: err }))
+      : Promise.resolve(null);
 
-  if (ttsPromises.length > 0) {
-    await Promise.race([
-      Promise.allSettled(ttsPromises),
-      new Promise(resolve => setTimeout(resolve, 15000)),
-    ]);
+    return { chunkId, chunk, ttsPromise };
+  });
+
+  if (!ttsEnabled) return;
+
+  // audio_chunk は chunk_id 順に await して直列送信
+  // これで届いた順（=再生順）が chunk_id 順と一致する
+  for (const { chunkId, chunk, ttsPromise } of chunkInfos) {
+    try {
+      // 全体タイムアウト 15秒
+      const result = await Promise.race([
+        ttsPromise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('TTS timeout')), 15000)),
+      ]);
+
+      if (result && result.error) {
+        console.warn(`[!] TTS error for ${chunkId}: ${result.error.message}`);
+        continue;
+      }
+      if (!result || !result.wavBuffer) continue;
+
+      const audioBase64 = wavToBase64(result.wavBuffer);
+      ws.send(JSON.stringify(createAudioChunk({
+        chunkId,
+        audioBase64,
+        format: 'wav',
+      })));
+
+      console.log(
+        `[♪] audio_chunk sent: id=${chunkId}, ` +
+        `text_len=${chunk.length}, wav_size=${Math.floor(result.wavBuffer.length / 1024)}KB`
+      );
+    } catch (err) {
+      console.warn(`[!] TTS/send error for ${chunkId}: ${err.message}`);
+    }
   }
 }
 
@@ -654,6 +694,10 @@ function splitIntoChunks(text) {
   return chunks;
 }
 
+/**
+ * intro セリフのような単発 TTS 用のヘルパ
+ * 順序保証不要な単一 chunk 用
+ */
 async function synthesizeAndSend(ws, chunkId, text, voiceParams) {
   const t0 = Date.now();
   const wavBuffer = await synthesize(text, voiceParams);
