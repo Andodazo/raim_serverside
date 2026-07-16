@@ -160,6 +160,29 @@
 //    → Flutter は bubble_break を受けたら _currentStreamingMessage をリセット
 //    → 次の text_chunk（本文）は別の吹き出しとして表示される
 //    → intro と本文が同じ吹き出しに繋がる問題を解消
+// server.js
+// ==============================================================================
+// RAiM 中継サーバー：v14_fix2（LLM 誤動作対策強化版）
+// ==============================================================================
+//
+// 【v14_fix2 での変更点】
+// C. 類似クエリの重複検知
+//    - query の頭15文字だけで判定（「二郎系ラーメン お」で始まる query は重複扱い）
+//    - 無駄な再検索を防ぐ
+//
+// E. 空応答フォールバック
+//    - LLM が空文字を返した時、ライムらしいエラーメッセージ表示
+//    - text_len=0 のまま chat_end 送るのを防ぐ
+//
+// F. 強制応答プロンプトの簡潔化
+//    - 長い指示は Gemma が混乱する
+//    - 「検索結果を踏まえて答えて。tools 使わないで。」に絞る
+//
+// 【v14 からの継承】
+// - bubble_break 対応
+// - filler 廃止
+// - audio_chunk 順序保証
+// - 12感情 + 正規化
 
 require('dotenv').config();
 const { WebSocketServer } = require('ws');
@@ -216,17 +239,34 @@ const MAX_TOOL_TURNS = 2;
 
 loadVoiceConfig();
 
-// v14: needsHeavyProcessing の filler ロジック廃止
-// ツール使う時は tool_intro で十分、ツール不要時は metadata の emotion 先送りで
-// 「待たされてる感」は既に緩和されてる
-
 function makeChunkIdGenerator(sessionId) {
   let counter = 0;
   return () => `${sessionId}_chunk_${counter++}`;
 }
 
+// ─────────────────────────────────────────────
+// 修正C: 類似クエリの重複検知
+// ─────────────────────────────────────────────
+
+/**
+ * ツール引数から重複判定用のキーを作る（v14_fix2 修正版）
+ *
+ * 【変更点】
+ * - query の頭15文字だけで判定（「二郎系ラーメン おすすめ 人気店」と「二郎系ラーメン おすすめ 人気店 日本 首都圏」は同じ扱いになる）
+ * - city はそのまま（東京と大阪は違う都市）
+ */
+function normalizeQueryForKey(args) {
+  if (args.query) {
+    return args.query.trim().slice(0, 15);
+  }
+  if (args.city) {
+    return args.city.trim().toLowerCase();
+  }
+  return JSON.stringify(args);
+}
+
 function makeToolCallKey(toolName, args) {
-  return `${toolName}:${JSON.stringify(args)}`;
+  return `${toolName}:${normalizeQueryForKey(args)}`;
 }
 
 function getSceneDefaultEmotions(picked) {
@@ -251,7 +291,7 @@ async function main() {
   console.log(`  Tools: ${TOOL_DEFINITIONS.map(t => t.function.name).join(', ')}`);
   console.log(`  Max tool turns: ${MAX_TOOL_TURNS}`);
   console.log(`  Emotions: ${ALL_EMOTIONS.length} types (normalized + overall_intensity)`);
-  console.log(`  Protocol: v14 (bubble_break support, ordered audio_chunk)`);
+  console.log(`  Protocol: v14_fix2 (bubble_break + fuzzy dedup + empty response fallback)`);
 
   if (!process.env.TAVILY_API_KEY) {
     console.warn('  ⚠ TAVILY_API_KEY not set, web_search will fail');
@@ -373,8 +413,6 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
     `overall=${metaResolved.overall_intensity}, dominant=${metaResolved.emotion}`
   );
 
-  // v14: needsHeavyProcessing の filler は廃止した（削除済み）
-
   let messages = buildMessages(
     picked.scene,
     userMessage,
@@ -389,7 +427,7 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
   let finalRawEmotions = rawDefaultEmotions;
   let toolError = false;
   let exitedDueToDuplicate = false;
-  let hasSentIntro = false;  // v14: intro を送ったかどうか（bubble_break 送信判定に使う）
+  let hasSentIntro = false;
   const seenToolCalls = new Set();
 
   while (toolTurn < MAX_TOOL_TURNS) {
@@ -405,6 +443,7 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
     if (llmResult.tool_calls && llmResult.tool_calls.length > 0) {
       console.log(`  [Tool Calls] ${llmResult.tool_calls.length} tool(s) requested`);
 
+      // 重複検知（v14_fix2: 類似クエリも検知）
       let hasDuplicate = false;
       for (const toolCall of llmResult.tool_calls) {
         const toolName = toolCall.function.name;
@@ -414,7 +453,7 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
         }
         const key = makeToolCallKey(toolName, toolArgs);
         if (seenToolCalls.has(key)) {
-          console.warn(`  [!] Duplicate tool call detected: ${key}`);
+          console.warn(`  [!] Duplicate/similar tool call detected: ${key}`);
           hasDuplicate = true;
           exitedDueToDuplicate = true;
           break;
@@ -434,8 +473,6 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
 
         seenToolCalls.add(makeToolCallKey(toolName, toolArgs));
 
-        // Tool intro を text_chunk + audio_chunk で送信
-        // audio は TTS 合成完了を待って直後に送信（1個だけなので順序問題なし）
         const introText = pickToolIntro(toolName, toolTurn);
         const introChunkId = nextChunkId();
         ws.send(JSON.stringify(createTextChunk({
@@ -451,7 +488,7 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
             .catch(err => console.warn(`  [TTS] Intro error: ${err.message}`));
         }
 
-        hasSentIntro = true;  // v14: intro 送ったフラグ
+        hasSentIntro = true;
 
         ws.send(JSON.stringify(createToolCall({
           tool: toolName,
@@ -482,7 +519,6 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
       continue;
     }
 
-    // ツールなし通常応答
     console.log(`  [No tool] LLM returned normal response`);
     const content = llmResult.content || '';
     try {
@@ -510,55 +546,61 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
     break;
   }
 
-  // 強制応答
+  // 強制応答（v14_fix2: プロンプトを簡潔化）
   if (finalText === '') {
     const reason = exitedDueToDuplicate
-      ? '同じツールの重複呼出を防ぐため'
+      ? '同じ・類似ツールの重複呼出を防ぐため'
       : `最大ターン数(${MAX_TOOL_TURNS})に到達したため`;
     console.log(`  [!] Forcing final response (${reason})`);
 
+    // v14_fix2: 簡潔なプロンプト。長い指示は Gemma が空応答返しがち
     const forcePrompt = toolError
-      ? '上記でいくつかツールを実行しました。一部失敗もありますが、得られた情報を踏まえて、ユーザーへの最終応答を生成してください。ツールはこれ以上使わず、tool ロールで返ってきた情報を活用して答えてください。応答はライムキャラのまま、JSON形式 {"type":"chat","text":"...","emotions":{"感情名":強さ,...}} で。'
-      : '上記のツール実行結果（tool ロールの content）を踏まえて、ユーザーへの最終応答を生成してください。ツールはこれ以上使わず、ツール結果の情報を活用して、ユーザーの質問に具体的に答えてください。応答はライムキャラのまま、JSON形式 {"type":"chat","text":"...","emotions":{"感情名":強さ,...}} で。';
+      ? '検索結果に一部失敗があったよ。得られた情報だけで、ライムキャラでユーザーに答えて。JSON形式 {"type":"chat","text":"...","emotions":{...}} で。'
+      : '上の検索結果を踏まえて、ライムキャラでユーザーに答えて。ツールはもう使わないで。JSON形式 {"type":"chat","text":"...","emotions":{...}} で。';
 
     messages.push({
       role: 'user',
       content: forcePrompt,
     });
 
-    const finalLlmResult = await callLLM(messages);
     try {
-      const cleaned = finalLlmResult
+      const finalLlmResult = await callLLM(messages);
+      const cleaned = (finalLlmResult || '')
         .replace(/^```json\s*/i, '')
         .replace(/^```\s*/i, '')
         .replace(/```\s*$/i, '')
         .trim();
-      const parsed = JSON.parse(cleaned);
-      finalText = parsed.text || finalLlmResult;
 
-      const parsedEmotions = sanitizeEmotions(parsed.emotions);
-      if (parsedEmotions) {
-        finalRawEmotions = parsedEmotions;
-      } else if (parsed.emotion) {
-        finalRawEmotions = emotionToEmotions(parsed.emotion, parsed.intensity);
+      if (cleaned) {
+        const parsed = JSON.parse(cleaned);
+        finalText = parsed.text || '';
+
+        const parsedEmotions = sanitizeEmotions(parsed.emotions);
+        if (parsedEmotions) {
+          finalRawEmotions = parsedEmotions;
+        } else if (parsed.emotion) {
+          finalRawEmotions = emotionToEmotions(parsed.emotion, parsed.intensity);
+        }
       }
     } catch (e) {
       console.warn(`  [!] Final force-response parse failed: ${e.message}`);
-      finalText = finalLlmResult;
     }
+  }
+
+  // 修正E: 空応答フォールバック
+  if (!finalText || finalText.trim() === '') {
+    console.warn(`  [!] Empty final response detected, using fallback message`);
+    finalText = 'えっと……調べてはみたんだけど、うまく言葉にまとまらなかった。ごめん、もう一回聞いてくれる？';
+    finalRawEmotions = { embarrassed: 0.5, sad: 0.3 };
   }
 
   const finalResolved = resolveEmotionsInput({ emotions: finalRawEmotions });
 
-  // v14: intro を送ってた場合、本文の前に bubble_break を送信
-  // Flutter は bubble_break を受けたら _currentStreamingMessage をリセットして、
-  // 次の text_chunk を新規メッセージとして扱う
   if (hasSentIntro) {
     ws.send(JSON.stringify(createBubbleBreak()));
     console.log(`  [>] bubble_break sent (intro was sent, separating from body)`);
   }
 
-  // 最終応答を text_chunk + audio_chunk（順序保証）で送信
   await sendFinalResponseAsChunks(
     ws, finalText,
     finalResolved.emotions, finalResolved.overall_intensity,
@@ -593,21 +635,6 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
   }
 }
 
-/**
- * v14: 最終応答を text_chunk + audio_chunk で送信、audio は順序保証
- *
- * 【設計】
- * - text_chunk は for ループで即送信（順番通り）
- * - TTS 合成は Promise.all で並列実行（速度のため）
- * - audio_chunk 送信は await ttsPromises[i] で直列化（順序のため）
- *
- * 【なぜ順序保証必要か】
- * v13 までは合成完了順に送っていたため、短い chunk が先に到着 → 音声が滅茶苦茶な順序で再生されてた。
- * Flutter の AudioPlayQueue は届いた順に再生する仕様なので、サーバー側で送信順=再生順にする。
- *
- * 【なぜ並列合成を維持】
- * chunk ごとに順次 TTS 待つと合計時間が (合成時間 × chunk数) になる。並列なら (最大合成時間) で済む。
- */
 async function sendFinalResponseAsChunks(ws, fullText, normalizedEmotions, overallIntensity, nextChunkId, ttsEnabled, isFirst) {
   if (!fullText || fullText.length === 0) return;
 
@@ -616,21 +643,16 @@ async function sendFinalResponseAsChunks(ws, fullText, normalizedEmotions, overa
     ? getVoiceParamsFromEmotions(normalizedEmotions, overallIntensity)
     : null;
 
-  // chunk ごとに chunk_id を割り当てて、TTS 合成を並列で開始
-  // Promise を配列に貯めて、後で順次 await する
   const chunkInfos = chunks.map((chunk, i) => {
     const chunkId = nextChunkId();
     const isFirstChunk = isFirst && i === 0;
 
-    // text_chunk は即送信（順番通り、text は速く出したい）
     ws.send(JSON.stringify(createTextChunk({
       text: chunk,
       chunkId,
       isFirst: isFirstChunk,
     })));
 
-    // TTS 合成を非同期で開始（並列）
-    // ここで await しない、Promise を返すだけ
     const ttsPromise = ttsEnabled && voiceParams
       ? synthesize(chunk, voiceParams)
           .then(wavBuffer => ({ chunkId, chunk, wavBuffer, error: null }))
@@ -642,11 +664,8 @@ async function sendFinalResponseAsChunks(ws, fullText, normalizedEmotions, overa
 
   if (!ttsEnabled) return;
 
-  // audio_chunk は chunk_id 順に await して直列送信
-  // これで届いた順（=再生順）が chunk_id 順と一致する
   for (const { chunkId, chunk, ttsPromise } of chunkInfos) {
     try {
-      // 全体タイムアウト 15秒
       const result = await Promise.race([
         ttsPromise,
         new Promise((_, reject) => setTimeout(() => reject(new Error('TTS timeout')), 15000)),
@@ -694,10 +713,6 @@ function splitIntoChunks(text) {
   return chunks;
 }
 
-/**
- * intro セリフのような単発 TTS 用のヘルパ
- * 順序保証不要な単一 chunk 用
- */
 async function synthesizeAndSend(ws, chunkId, text, voiceParams) {
   const t0 = Date.now();
   const wavBuffer = await synthesize(text, voiceParams);
