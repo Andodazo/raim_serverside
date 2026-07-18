@@ -183,12 +183,79 @@
 // - filler 廃止
 // - audio_chunk 順序保証
 // - 12感情 + 正規化
+// 【v16 での変更点】
+// 1. チャンク送信ごとにタイミングログを出す
+//    "[~] chunk +XXXms" が数百 ms 間隔で並べば真のストリーミング、
+//    全部同じ ms なら Ollama 側でバッファされている（＝一括送信と同じ）。
+//    切り分け用なので、確認が済んだら STREAM_TIMING_LOG=false で黙らせられる。
+//
+// 2. ツール実行後は tools を渡さない（MULTI_TURN_TOOLS=false が既定）
+//    v15 までは Turn 2 も tools 付きで呼んでいたため、Gemma 4 12B が
+//    同じツールを呼び直したり "tool_result" を捏造したりして 1 ターン無駄になり、
+//    LLM 呼び出しが 3 回（合計 36 秒）になっていた。
+//    ツール結果が messages に入った時点で tools を外し、
+//    callLLMStream（tools なし・format:'json'）で本文だけ生成する。
+//    → LLM 2 回で済み、ツール名の捏造も構造的に起きなくなる。
+//    多段ツール連鎖（天気を見てから検索、等）が必要になったら
+//    MULTI_TURN_TOOLS=true で v15 の挙動に戻せる。
+//
+// 【v15 / v15_fix からの継承】
+// - callLLMStreamWithTools による token 単位の真のストリーミング
+// - 未知ツール名を intro 送信前にフィルタ
+// - bubble_break（tool intro と本文の吹き出し分離）
+// - audio_chunk の送信順を chunk_id 順に直列化（合成は並列）
+// - 類似クエリの重複検知 / 空応答フォールバック / 12感情 + 正規化
+//
+//
+// 【v15 での変更点 — 本命】
+// ツール判断と本文生成を 1 パスに統合し、token 単位の真のストリーミングにした。
+//
+//   v14_fix2 まで:
+//     callLLMWithTools (stream:false) で全文生成
+//       → splitIntoChunks で機械的に分割
+//       → for ループで一気に ws.send
+//     → Flutter には数 ms 以内に全 chunk が到着し、体感は「一瞬で全文表示」
+//
+//   v15:
+//     callLLMStreamWithTools (stream:true) で token を受信
+//       → StreamingTextExtractor が JSON の text 値だけを増分抽出
+//       → 抽出できた瞬間に text_chunk 送信 + TTS 合成開始
+//     → 実測でチャンク間隔 140〜270ms、typewriter 表示になる
+//
+// 【なぜ 1 パスにしたか】
+// ツール判断を stream:false で別途行うと、ツール不要の通常応答（最も多く、
+// 最もストリーミングを見せたいケース）で全文生成が二重になり、体感が倍遅くなる。
+// Ollama 0.32.1 で Gemma 4 の tool calling が改善されたため、
+// tools 付き streaming を 1 パスで回す構成が現実的になった。
+//
+// 【text と tool_calls が両方来た場合】
+// Gemma 4 は tool_calls を返すとき content が空になる傾向があり、通常は
+// どちらか一方しか来ない。万一 text を送った後に tool_calls が来た場合は
+// 警告ログを出し、送信済みテキストは intro 扱い（bubble_break で本文と分離）にする。
+//
+// 【audio_chunk の順序保証】
+// TTS は chunk が確定した瞬間に並列で合成を開始するが、送信は Promise チェーンで
+// 直列化する。合成は並列（速い）、送信順は chunk_id 順（音声が本文通りに流れる）。
+//
+// 【v14 / v14_fix / v14_fix2 からの継承】
+// - bubble_break（tool intro と本文の吹き出し分離）
+// - needsHeavyProcessing 由来の filler 廃止
+// - unknown tool を throw せず error result で返す（lib/tools/index.js 側）
+// - 類似クエリの重複検知（query 先頭15文字）
+// - 空応答フォールバック
+// - 12感情 + 正規化 + overall_intensity
 
 require('dotenv').config();
 const { WebSocketServer } = require('ws');
-const { callLLM, callLLMStream, callLLMWithTools } = require('./lib/llm');
+const {
+  callLLM,
+  callLLMStream,
+  callLLMWithTools,
+  callLLMStreamWithTools,
+} = require('./lib/llm');
 const { buildMessages, getTimeContext } = require('./lib/prompt-builder');
 const { pickScene } = require('./lib/pick-scene');
+const { StreamingTextExtractor } = require('./lib/streaming-parser');
 const {
   MemoryStore,
   Role,
@@ -210,9 +277,9 @@ const {
   executeTool,
   pickToolIntro,
   getToolDescription,
+  isValidToolName,
 } = require('./lib/tools');
 const {
-  EMOTIONS,
   ALL_EMOTIONS,
   ERROR_CODES,
   createError,
@@ -225,8 +292,6 @@ const {
   createBubbleBreak,
   validateUpstream,
   sanitizeEmotions,
-  normalizeAndComputeIntensity,
-  getDominantEmotion,
   emotionToEmotions,
   resolveEmotionsInput,
 } = require('./lib/types');
@@ -234,34 +299,34 @@ const {
 const PORT = 8080;
 const memoryStore = MemoryStore.create();
 const DEFAULT_ACTOR_ID = 'default_user';
-const STREAMING_ENABLED = process.env.RAIM_STREAMING !== 'false';
 const MAX_TOOL_TURNS = 2;
 
+// ストリーミングを無効にすると v14_fix2 相当の一括生成にフォールバックする
+const STREAMING_ENABLED = process.env.RAIM_STREAMING !== 'false';
+
+// チャンク送信ごとのタイミングログ（ストリーミング検証用、既定 ON）
+const STREAM_TIMING_LOG = process.env.STREAM_TIMING_LOG !== 'false';
+
+// ツール実行後も tools を渡し続けるか（既定 OFF）
+// OFF: ツール結果が入ったら tools を外し、本文生成だけを streaming で行う
+// ON : v15 の挙動。多段ツール連鎖ができるが、12B では空回りしやすい
+const MULTI_TURN_TOOLS = process.env.MULTI_TURN_TOOLS === 'true';
+
 loadVoiceConfig();
+
+// ─────────────────────────────────────────────
+// 小物ユーティリティ
+// ─────────────────────────────────────────────
 
 function makeChunkIdGenerator(sessionId) {
   let counter = 0;
   return () => `${sessionId}_chunk_${counter++}`;
 }
 
-// ─────────────────────────────────────────────
-// 修正C: 類似クエリの重複検知
-// ─────────────────────────────────────────────
-
-/**
- * ツール引数から重複判定用のキーを作る（v14_fix2 修正版）
- *
- * 【変更点】
- * - query の頭15文字だけで判定（「二郎系ラーメン おすすめ 人気店」と「二郎系ラーメン おすすめ 人気店 日本 首都圏」は同じ扱いになる）
- * - city はそのまま（東京と大阪は違う都市）
- */
+/** query の先頭15文字だけで重複判定する（類似クエリの再検索を防ぐ） */
 function normalizeQueryForKey(args) {
-  if (args.query) {
-    return args.query.trim().slice(0, 15);
-  }
-  if (args.city) {
-    return args.city.trim().toLowerCase();
-  }
+  if (args.query) return args.query.trim().slice(0, 15);
+  if (args.city) return args.city.trim().toLowerCase();
   return JSON.stringify(args);
 }
 
@@ -270,18 +335,141 @@ function makeToolCallKey(toolName, args) {
 }
 
 function getSceneDefaultEmotions(picked) {
-  if (picked.defaultEmotions) {
-    return picked.defaultEmotions;
-  }
+  if (picked.defaultEmotions) return picked.defaultEmotions;
   return emotionToEmotions(picked.defaultEmotion, picked.defaultIntensity);
 }
+
+function parseToolArgs(raw) {
+  if (typeof raw !== 'string') return raw || {};
+  try {
+    return JSON.parse(raw);
+  } catch {
+    console.warn(`  [Tool] Failed to parse arguments: ${raw}`);
+    return {};
+  }
+}
+
+function stripJsonFence(text) {
+  return (text || '')
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```\s*$/i, '')
+    .trim();
+}
+
+/**
+ * チャンク送信のタイミングを記録する（ストリーミング検証用）
+ *
+ * 出力例:
+ *   [~] chunk +8200ms (Δ0ms) "えっと、"
+ *   [~] chunk +8450ms (Δ250ms) "今のところ東京は厚い雲がかかってるみたいだよ。"
+ *
+ * Δ が数百 ms 空いていれば真のストリーミング。
+ * Δ が全部 0〜数 ms なら Ollama 側でバッファされており、
+ * 体感は一括送信と変わらない。
+ */
+function createChunkTimer(label) {
+  const startedAt = Date.now();
+  let lastAt = null;
+  let count = 0;
+
+  return {
+    mark(text) {
+      if (!STREAM_TIMING_LOG) return;
+      const now = Date.now();
+      const elapsed = now - startedAt;
+      const delta = lastAt === null ? 0 : now - lastAt;
+      lastAt = now;
+      count++;
+      console.log(`  [~] ${label} chunk#${count} +${elapsed}ms (Δ${delta}ms) "${text}"`);
+    },
+    summary() {
+      if (!STREAM_TIMING_LOG || count === 0) return;
+      console.log(`  [~] ${label}: ${count} chunks over ${Date.now() - startedAt}ms`);
+    },
+  };
+}
+
+/**
+ * StreamingTextExtractor の戻り値を string[] に正規化する
+ *   feed(token) => string[]（該当なしは []）
+ *   flush()     => string | null
+ */
+function normalizeToChunks(result) {
+  if (result === null || result === undefined) return [];
+  if (Array.isArray(result)) return result;
+  if (typeof result === 'string') return result.length > 0 ? [result] : [];
+  return [];
+}
+
+// ─────────────────────────────────────────────
+// 音声送信キュー（合成は並列、送信は直列）
+// ─────────────────────────────────────────────
+
+/**
+ * TTS 合成を即座に開始しつつ、audio_chunk の送信順を enqueue 順に保つ。
+ *
+ * synthesize() は呼んだ瞬間に走り出すので合成自体は並列。
+ * 送信だけを Promise チェーンで直列化することで、
+ * 短い chunk が先に合成完了しても送信順は崩れない。
+ */
+function createAudioSender(ws, ttsEnabled) {
+  let chain = Promise.resolve();
+  let count = 0;
+
+  return {
+    enqueue(chunkId, text, voiceParams) {
+      if (!ttsEnabled || !voiceParams) return;
+      count++;
+
+      const ttsPromise = synthesize(text, voiceParams)
+        .then((wavBuffer) => ({ wavBuffer, error: null }))
+        .catch((error) => ({ wavBuffer: null, error }));
+
+      chain = chain.then(async () => {
+        const { wavBuffer, error } = await ttsPromise;
+        if (error) {
+          console.warn(`[!] TTS error for ${chunkId}: ${error.message}`);
+          return;
+        }
+        if (!wavBuffer) return;
+        try {
+          ws.send(JSON.stringify(createAudioChunk({
+            chunkId,
+            audioBase64: wavToBase64(wavBuffer),
+            format: 'wav',
+          })));
+          console.log(
+            `[♪] audio_chunk sent: id=${chunkId}, ` +
+            `text_len=${text.length}, wav_size=${Math.floor(wavBuffer.length / 1024)}KB`
+          );
+        } catch (e) {
+          console.warn(`[!] audio_chunk send failed for ${chunkId}: ${e.message}`);
+        }
+      });
+    },
+
+    /** 全 audio_chunk の送信完了を待つ（上限つき） */
+    async drain(timeoutMs = 20000) {
+      if (count === 0) return;
+      await Promise.race([
+        chain,
+        new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+      ]);
+    },
+  };
+}
+
+// ─────────────────────────────────────────────
+// 起動
+// ─────────────────────────────────────────────
 
 async function main() {
   const voicevoxOk = await checkVoicevoxAvailable();
 
   const wss = new WebSocketServer({ port: PORT });
   console.log(`\u2713 RAiM local server listening on ws://127.0.0.1:${PORT}`);
-  console.log(`  Streaming mode: ${STREAMING_ENABLED ? 'ON' : 'OFF'}`);
+  console.log(`  Streaming mode: ${STREAMING_ENABLED ? 'ON (true token streaming, v15)' : 'OFF (batched fallback)'}`);
   console.log(`  TTS mode: ${voicevoxOk ? 'ON (server-side VOICEVOX)' : 'OFF (text only)'}`);
   console.log(`  ${getTimeContext()}`);
   const profileInfo = getActiveProfileInfo();
@@ -291,7 +479,9 @@ async function main() {
   console.log(`  Tools: ${TOOL_DEFINITIONS.map(t => t.function.name).join(', ')}`);
   console.log(`  Max tool turns: ${MAX_TOOL_TURNS}`);
   console.log(`  Emotions: ${ALL_EMOTIONS.length} types (normalized + overall_intensity)`);
-  console.log(`  Protocol: v14_fix2 (bubble_break + fuzzy dedup + empty response fallback)`);
+  console.log(`  Multi-turn tools: ${MULTI_TURN_TOOLS ? 'ON' : 'OFF (tools dropped after execution)'}`);
+  console.log(`  Chunk timing log: ${STREAM_TIMING_LOG ? 'ON' : 'OFF'}`);
+  console.log(`  Protocol: v16 (bubble_break, ordered audio, token streaming)`);
 
   if (!process.env.TAVILY_API_KEY) {
     console.warn('  ⚠ TAVILY_API_KEY not set, web_search will fail');
@@ -348,7 +538,10 @@ async function main() {
       const imageBase64Array = imageObjects.map(img => img.data);
       const hasImage = imageBase64Array.length > 0;
 
-      console.log(`[<] User: ${userMessage} (session=${sessionId}${hasImage ? `, images=${imageBase64Array.length}` : ''}) [${getTimeContext()}]`);
+      console.log(
+        `[<] User: ${userMessage} (session=${sessionId}` +
+        `${hasImage ? `, images=${imageBase64Array.length}` : ''}) [${getTimeContext()}]`
+      );
 
       try {
         const t0 = Date.now();
@@ -367,7 +560,7 @@ async function main() {
         );
 
         await handleRequest(ws, picked, userMessage, hasImage, imageBase64Array, history, {
-          actorId, sessionId, t0, t1,
+          actorId, sessionId, t0,
           ttsEnabled: connectionContext.ttsEnabled,
         });
       } catch (err) {
@@ -397,9 +590,14 @@ async function main() {
   });
 }
 
+// ─────────────────────────────────────────────
+// メイン処理
+// ─────────────────────────────────────────────
+
 async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array, history, ctx) {
-  const { actorId, sessionId, t0, t1, ttsEnabled } = ctx;
+  const { actorId, sessionId, t0, ttsEnabled } = ctx;
   const nextChunkId = makeChunkIdGenerator(sessionId);
+  const audioSender = createAudioSender(ws, ttsEnabled);
 
   const rawDefaultEmotions = getSceneDefaultEmotions(picked);
   const metaResolved = resolveEmotionsInput({ emotions: rawDefaultEmotions });
@@ -413,7 +611,18 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
     `overall=${metaResolved.overall_intensity}, dominant=${metaResolved.emotion}`
   );
 
-  let messages = buildMessages(
+  // 本文の音声パラメータはシーンの default_emotions ベースで固定する。
+  // 実際の emotions は JSON パース完了後（＝本文送信後）にしか分からないため、
+  // ストリーミング中は先に確定しているシーン既定値を使う。
+  const bodyVoiceParams = ttsEnabled
+    ? getVoiceParamsFromEmotions(metaResolved.emotions, metaResolved.overall_intensity)
+    : null;
+  // intro / filler は少し控えめの強度で喋らせる
+  const introVoiceParams = ttsEnabled
+    ? getVoiceParamsFromEmotions(metaResolved.emotions, 0.6)
+    : null;
+
+  const messages = buildMessages(
     picked.scene,
     userMessage,
     history,
@@ -421,18 +630,211 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
     { withTools: true }
   );
 
-  let toolTurn = 0;
-  let imageDescription = null;
-  let finalText = '';
-  let finalRawEmotions = rawDefaultEmotions;
-  let toolError = false;
-  let exitedDueToDuplicate = false;
-  let hasSentIntro = false;
-  const seenToolCalls = new Set();
+  const state = {
+    finalText: '',
+    finalRawEmotions: rawDefaultEmotions,
+    imageDescription: null,
+    hasSentIntro: false,
+    hasStreamedBody: false,
+    toolError: false,
+    exitedDueToDuplicate: false,
+    hallucinatedTool: false,
+    toolsExecuted: false,
+    seenToolCalls: new Set(),
+    toolTurn: 0,
+  };
 
-  while (toolTurn < MAX_TOOL_TURNS) {
-    toolTurn++;
-    console.log(`[Tool Loop] Turn ${toolTurn}/${MAX_TOOL_TURNS}`);
+  if (STREAMING_ENABLED) {
+    await runStreamingToolLoop(ws, messages, state, {
+      nextChunkId, audioSender, bodyVoiceParams, introVoiceParams, ttsEnabled,
+    });
+  } else {
+    await runBatchedToolLoop(ws, messages, state, {
+      nextChunkId, audioSender, bodyVoiceParams, introVoiceParams, ttsEnabled,
+    });
+  }
+
+  // ── 本文が取れなかった場合の強制応答 ────────────────
+  if (state.finalText === '' && !state.hasStreamedBody) {
+    await forceFinalResponse(ws, messages, state, {
+      nextChunkId, audioSender, bodyVoiceParams, ttsEnabled,
+    });
+  }
+
+  // ── 空応答フォールバック ────────────────────────
+  if (!state.finalText || state.finalText.trim() === '') {
+    console.warn('  [!] Empty final response, using fallback message');
+    state.finalText = 'えっと……調べてはみたんだけど、うまく言葉にまとまらなかった。ごめん、もう一回聞いてくれる？';
+    state.finalRawEmotions = { embarrassed: 0.5, sad: 0.3 };
+
+    // フォールバック文はまだ送っていないので、ここで送る
+    if (!state.hasStreamedBody) {
+      if (state.hasSentIntro) {
+        ws.send(JSON.stringify(createBubbleBreak()));
+        console.log('  [>] bubble_break sent (before fallback body)');
+      }
+      await sendTextAsChunks(ws, state.finalText, {
+        nextChunkId, audioSender, voiceParams: bodyVoiceParams,
+        isFirst: !state.hasSentIntro,
+      });
+      state.hasStreamedBody = true;
+    }
+  }
+
+  // ── 全 audio_chunk の送信完了を待つ ──────────────
+  await audioSender.drain();
+
+  // ── chat_end ────────────────────────────────
+  const finalResolved = resolveEmotionsInput({ emotions: state.finalRawEmotions });
+  ws.send(JSON.stringify(createChatEnd({
+    fullText: state.finalText,
+    emotions: state.finalRawEmotions,
+  })));
+
+  const t2 = Date.now();
+  console.log(
+    `[>] chat_end: emotions=${JSON.stringify(finalResolved.emotions)}, ` +
+    `overall=${finalResolved.overall_intensity}, dominant=${finalResolved.emotion}, ` +
+    `text_len=${state.finalText.length}, toolTurns=${state.seenToolCalls.size}, ` +
+    `total=${t2 - t0}ms`
+  );
+
+  // ── 履歴記録 ────────────────────────────────
+  const userContent = buildUserContentWithImage(userMessage, state.imageDescription);
+  await memoryStore.createEvent({
+    actorId,
+    sessionId,
+    payload: [
+      { role: Role.USER, content: { text: userContent } },
+      { role: Role.ASSISTANT, content: { text: state.finalText } },
+    ],
+  });
+
+  if (state.imageDescription) {
+    console.log(`[+] Image described: "${state.imageDescription.slice(0, 60)}..."`);
+  }
+}
+
+// ─────────────────────────────────────────────
+// v15 本命: ストリーミング版ツールループ
+// ─────────────────────────────────────────────
+
+async function runStreamingToolLoop(ws, messages, state, io) {
+  const { nextChunkId, audioSender, bodyVoiceParams, introVoiceParams, ttsEnabled } = io;
+
+  while (state.toolTurn < MAX_TOOL_TURNS) {
+    state.toolTurn++;
+    console.log(`[Tool Loop] Turn ${state.toolTurn}/${MAX_TOOL_TURNS} (streaming)`);
+
+    const extractor = new StreamingTextExtractor();
+    const timer = createChunkTimer(`turn${state.toolTurn}`);
+    let rawContent = '';
+    let thinking = '';
+    let toolCalls = null;
+    let sentChunkThisTurn = false;
+    let firstChunkAt = null;
+    const turnStartedAt = Date.now();
+
+    // ── LLM ストリーム受信 ────────────────────
+    for await (const ev of callLLMStreamWithTools(messages, TOOL_DEFINITIONS)) {
+      if (ev.type === 'thinking') {
+        thinking += ev.content;
+        continue;
+      }
+
+      if (ev.type === 'tool_calls') {
+        toolCalls = ev.tool_calls;
+        continue;
+      }
+
+      if (ev.type === 'token') {
+        rawContent += ev.content;
+
+        const chunks = normalizeToChunks(extractor.feed(ev.content));
+        for (const chunk of chunks) {
+          // 本文の最初のチャンクを出す直前に、intro との吹き出しを分ける
+          if (!sentChunkThisTurn && state.hasSentIntro && !state.hasStreamedBody) {
+            ws.send(JSON.stringify(createBubbleBreak()));
+            console.log('  [>] bubble_break sent (intro → body)');
+          }
+
+          const chunkId = nextChunkId();
+          ws.send(JSON.stringify(createTextChunk({
+            text: chunk,
+            chunkId,
+            isFirst: !state.hasSentIntro && !state.hasStreamedBody && !sentChunkThisTurn,
+          })));
+          audioSender.enqueue(chunkId, chunk, bodyVoiceParams);
+          timer.mark(chunk);
+
+          if (firstChunkAt === null) {
+            firstChunkAt = Date.now();
+            console.log(`  [~] first body chunk at +${firstChunkAt - turnStartedAt}ms`);
+          }
+          sentChunkThisTurn = true;
+          state.hasStreamedBody = true;
+        }
+      }
+    }
+
+    if (thinking) {
+      console.log(`  [Thinking] ${thinking.slice(0, 200).replace(/\n/g, ' ')}...`);
+    }
+
+    // ── ツール呼出あり ──────────────────────
+    if (toolCalls && toolCalls.length > 0) {
+      if (sentChunkThisTurn) {
+        // 想定外だが致命ではない。送信済みテキストは intro 扱いにする
+        console.warn('  [!] tool_calls arrived after body text was streamed. Treating sent text as intro.');
+        state.hasSentIntro = true;
+        state.hasStreamedBody = false;
+      }
+
+      const shouldBreak = await handleToolCalls(ws, messages, toolCalls, state, {
+        nextChunkId, audioSender, introVoiceParams, ttsEnabled,
+      });
+      if (shouldBreak) break;
+
+      // v16: ツールを実行したら tools を外して本文生成に移る。
+      // Gemma 4 12B は tool 結果を渡されても同じツールを呼び直したり
+      // 架空のツール名を返したりして 1 ターン空回りしやすいため、
+      // ツールを呼びようがない状態（tools なし）で本文だけ生成させる。
+      if (!MULTI_TURN_TOOLS) {
+        state.toolsExecuted = true;
+        break;
+      }
+      continue;
+    }
+
+    // ── ツールなし = 本文が流れ切った ──────────
+    console.log(`  [No tool] streamed body (${rawContent.length} chars raw)`);
+    // flush で残りを吐き出す
+    const remaining = normalizeToChunks(extractor.flush());
+    for (const chunk of remaining) {
+      const chunkId = nextChunkId();
+      ws.send(JSON.stringify(createTextChunk({ text: chunk, chunkId })));
+      audioSender.enqueue(chunkId, chunk, bodyVoiceParams);
+      timer.mark(chunk);
+      state.hasStreamedBody = true;
+    }
+    timer.summary();
+
+    // 完成した JSON から text / emotions / image_description を回収
+    applyParsedContent(rawContent, state, extractor);
+    break;
+  }
+}
+
+// ─────────────────────────────────────────────
+// フォールバック: 一括生成版ツールループ（RAIM_STREAMING=false 用）
+// ─────────────────────────────────────────────
+
+async function runBatchedToolLoop(ws, messages, state, io) {
+  const { nextChunkId, audioSender, bodyVoiceParams, introVoiceParams, ttsEnabled } = io;
+
+  while (state.toolTurn < MAX_TOOL_TURNS) {
+    state.toolTurn++;
+    console.log(`[Tool Loop] Turn ${state.toolTurn}/${MAX_TOOL_TURNS} (batched)`);
 
     const llmResult = await callLLMWithTools(messages, TOOL_DEFINITIONS);
 
@@ -441,256 +843,247 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
     }
 
     if (llmResult.tool_calls && llmResult.tool_calls.length > 0) {
-      console.log(`  [Tool Calls] ${llmResult.tool_calls.length} tool(s) requested`);
-
-      // 重複検知（v14_fix2: 類似クエリも検知）
-      let hasDuplicate = false;
-      for (const toolCall of llmResult.tool_calls) {
-        const toolName = toolCall.function.name;
-        let toolArgs = toolCall.function.arguments;
-        if (typeof toolArgs === 'string') {
-          try { toolArgs = JSON.parse(toolArgs); } catch { toolArgs = {}; }
-        }
-        const key = makeToolCallKey(toolName, toolArgs);
-        if (seenToolCalls.has(key)) {
-          console.warn(`  [!] Duplicate/similar tool call detected: ${key}`);
-          hasDuplicate = true;
-          exitedDueToDuplicate = true;
-          break;
-        }
-      }
-      if (hasDuplicate) break;
-
-      for (const toolCall of llmResult.tool_calls) {
-        const toolName = toolCall.function.name;
-        let toolArgs = toolCall.function.arguments;
-        if (typeof toolArgs === 'string') {
-          try { toolArgs = JSON.parse(toolArgs); } catch (e) {
-            console.warn(`  [Tool] Failed to parse arguments: ${toolArgs}`);
-            toolArgs = {};
-          }
-        }
-
-        seenToolCalls.add(makeToolCallKey(toolName, toolArgs));
-
-        const introText = pickToolIntro(toolName, toolTurn);
-        const introChunkId = nextChunkId();
-        ws.send(JSON.stringify(createTextChunk({
-          text: introText,
-          chunkId: introChunkId,
-          isFirst: toolTurn === 1,
-        })));
-        console.log(`  [Intro] ${introText}`);
-
-        if (ttsEnabled) {
-          const voiceParams = getVoiceParamsFromEmotions(metaResolved.emotions, 0.6);
-          synthesizeAndSend(ws, introChunkId, introText, voiceParams)
-            .catch(err => console.warn(`  [TTS] Intro error: ${err.message}`));
-        }
-
-        hasSentIntro = true;
-
-        ws.send(JSON.stringify(createToolCall({
-          tool: toolName,
-          description: getToolDescription(toolName, toolArgs),
-          estimatedSeconds: 3,
-        })));
-        console.log(`  [>] tool_call: ${toolName}`);
-
-        const toolResult = await executeTool(toolName, toolArgs);
-
-        if (toolResult && toolResult.error) {
-          toolError = true;
-          console.warn(`  [!] Tool returned error: ${toolResult.message}`);
-        }
-
-        messages.push({
-          role: 'assistant',
-          content: '',
-          tool_calls: [toolCall],
-        });
-        messages.push({
-          role: 'tool',
-          name: toolName,
-          content: JSON.stringify(toolResult),
-        });
-      }
-
+      const shouldBreak = await handleToolCalls(ws, messages, llmResult.tool_calls, state, {
+        nextChunkId, audioSender, introVoiceParams, ttsEnabled,
+      });
+      if (shouldBreak) break;
       continue;
     }
 
-    console.log(`  [No tool] LLM returned normal response`);
-    const content = llmResult.content || '';
-    try {
-      const cleaned = content
-        .replace(/^```json\s*/i, '')
-        .replace(/^```\s*/i, '')
-        .replace(/```\s*$/i, '')
-        .trim();
-      const parsed = JSON.parse(cleaned);
+    console.log('  [No tool] LLM returned normal response');
+    applyParsedContent(llmResult.content || '', state, null);
 
-      finalText = parsed.text || '';
-
-      const parsedEmotions = sanitizeEmotions(parsed.emotions);
-      if (parsedEmotions) {
-        finalRawEmotions = parsedEmotions;
-      } else if (parsed.emotion) {
-        finalRawEmotions = emotionToEmotions(parsed.emotion, parsed.intensity);
+    if (state.finalText) {
+      if (state.hasSentIntro) {
+        ws.send(JSON.stringify(createBubbleBreak()));
+        console.log('  [>] bubble_break sent (intro → body)');
       }
-
-      if (parsed.image_description) imageDescription = parsed.image_description;
-    } catch (e) {
-      console.warn(`  [!] Failed to parse LLM JSON: ${e.message}, content="${content.slice(0, 200)}"`);
-      finalText = content;
+      await sendTextAsChunks(ws, state.finalText, {
+        nextChunkId, audioSender, voiceParams: bodyVoiceParams,
+        isFirst: !state.hasSentIntro,
+      });
+      state.hasStreamedBody = true;
     }
     break;
   }
+}
 
-  // 強制応答（v14_fix2: プロンプトを簡潔化）
-  if (finalText === '') {
-    const reason = exitedDueToDuplicate
-      ? '同じ・類似ツールの重複呼出を防ぐため'
-      : `最大ターン数(${MAX_TOOL_TURNS})に到達したため`;
-    console.log(`  [!] Forcing final response (${reason})`);
+// ─────────────────────────────────────────────
+// ツール呼出の処理（ストリーミング/一括で共通）
+// ─────────────────────────────────────────────
 
-    // v14_fix2: 簡潔なプロンプト。長い指示は Gemma が空応答返しがち
-    const forcePrompt = toolError
-      ? '検索結果に一部失敗があったよ。得られた情報だけで、ライムキャラでユーザーに答えて。JSON形式 {"type":"chat","text":"...","emotions":{...}} で。'
-      : '上の検索結果を踏まえて、ライムキャラでユーザーに答えて。ツールはもう使わないで。JSON形式 {"type":"chat","text":"...","emotions":{...}} で。';
+/**
+ * @returns {boolean} true なら重複検知でループを抜ける
+ */
+async function handleToolCalls(ws, messages, toolCalls, state, io) {
+  const { nextChunkId, audioSender, introVoiceParams } = io;
 
-    messages.push({
-      role: 'user',
-      content: forcePrompt,
-    });
+  console.log(`  [Tool Calls] ${toolCalls.length} tool(s) requested`);
 
-    try {
-      const finalLlmResult = await callLLM(messages);
-      const cleaned = (finalLlmResult || '')
-        .replace(/^```json\s*/i, '')
-        .replace(/^```\s*/i, '')
-        .replace(/```\s*$/i, '')
-        .trim();
+  // ── 未知ツール名を intro 送信前に弾く（v15_fix） ──────────────
+  // Gemma 4 は tool 結果を受け取った後、"tool_result" のような存在しない
+  // ツール名を呼ぶことがある。executeTool 側でも error result を返して
+  // サーバーは落ちないようにしてあるが、そこまで進むと
+  // 無駄な intro（「えっと、ちょっと待って」）と tool_call バナーが
+  // クライアントに飛んでしまう。ここで先に落とす。
+  const validToolCalls = toolCalls.filter((tc) => {
+    const name = tc.function && tc.function.name;
+    if (isValidToolName(name)) return true;
+    console.warn(`  [!] Hallucinated tool name ignored: "${name}"`);
+    return false;
+  });
 
-      if (cleaned) {
-        const parsed = JSON.parse(cleaned);
-        finalText = parsed.text || '';
+  if (validToolCalls.length === 0) {
+    state.hallucinatedTool = true;
+    return true;  // ループを抜けて強制応答へ
+  }
 
-        const parsedEmotions = sanitizeEmotions(parsed.emotions);
-        if (parsedEmotions) {
-          finalRawEmotions = parsedEmotions;
-        } else if (parsed.emotion) {
-          finalRawEmotions = emotionToEmotions(parsed.emotion, parsed.intensity);
-        }
-      }
-    } catch (e) {
-      console.warn(`  [!] Final force-response parse failed: ${e.message}`);
+  // 重複・類似クエリの検知
+  for (const toolCall of validToolCalls) {
+    const toolName = toolCall.function.name;
+    const toolArgs = parseToolArgs(toolCall.function.arguments);
+    const key = makeToolCallKey(toolName, toolArgs);
+    if (state.seenToolCalls.has(key)) {
+      console.warn(`  [!] Duplicate/similar tool call detected: ${key}`);
+      state.exitedDueToDuplicate = true;
+      return true;
     }
   }
 
-  // 修正E: 空応答フォールバック
-  if (!finalText || finalText.trim() === '') {
-    console.warn(`  [!] Empty final response detected, using fallback message`);
-    finalText = 'えっと……調べてはみたんだけど、うまく言葉にまとまらなかった。ごめん、もう一回聞いてくれる？';
-    finalRawEmotions = { embarrassed: 0.5, sad: 0.3 };
+  for (const toolCall of validToolCalls) {
+    const toolName = toolCall.function.name;
+    const toolArgs = parseToolArgs(toolCall.function.arguments);
+
+    state.seenToolCalls.add(makeToolCallKey(toolName, toolArgs));
+
+    // 前置きセリフ（「調べるね」）
+    const introText = pickToolIntro(toolName, state.toolTurn);
+    const introChunkId = nextChunkId();
+    ws.send(JSON.stringify(createTextChunk({
+      text: introText,
+      chunkId: introChunkId,
+      isFirst: state.toolTurn === 1 && !state.hasSentIntro,
+    })));
+    audioSender.enqueue(introChunkId, introText, introVoiceParams);
+    console.log(`  [Intro] ${introText}`);
+    state.hasSentIntro = true;
+
+    ws.send(JSON.stringify(createToolCall({
+      tool: toolName,
+      description: getToolDescription(toolName, toolArgs),
+      estimatedSeconds: 3,
+    })));
+    console.log(`  [>] tool_call: ${toolName}`);
+
+    const toolResult = await executeTool(toolName, toolArgs);
+    if (toolResult && toolResult.error) {
+      state.toolError = true;
+      console.warn(`  [!] Tool returned error: ${toolResult.message}`);
+    }
+
+    messages.push({ role: 'assistant', content: '', tool_calls: [toolCall] });
+    messages.push({ role: 'tool', name: toolName, content: JSON.stringify(toolResult) });
   }
 
-  const finalResolved = resolveEmotionsInput({ emotions: finalRawEmotions });
+  return false;
+}
 
-  if (hasSentIntro) {
+// ─────────────────────────────────────────────
+// 強制応答（ツールループが本文なしで抜けた場合）
+// ─────────────────────────────────────────────
+
+async function forceFinalResponse(ws, messages, state, io) {
+  const { nextChunkId, audioSender, bodyVoiceParams } = io;
+
+  const reason = state.toolsExecuted
+    ? 'ツール実行後の本文生成（tools なし）'
+    : state.hallucinatedTool
+      ? '存在しないツール名が呼ばれたため'
+      : state.exitedDueToDuplicate
+        ? '同じ・類似ツールの重複呼出を防ぐため'
+        : `最大ターン数(${MAX_TOOL_TURNS})に到達したため`;
+  console.log(`  [>] Generating body without tools (${reason})`);
+
+  // 長い指示は Gemma が空応答を返しやすいので簡潔に
+  const forcePrompt = state.toolError
+    ? '検索結果に一部失敗があったよ。得られた情報だけで、ライムキャラでユーザーに答えて。JSON形式 {"type":"chat","text":"...","emotions":{...}} で。'
+    : '上の結果を踏まえて、ライムキャラでユーザーに答えて。JSON形式 {"type":"chat","text":"...","emotions":{...}} で。';
+
+  messages.push({ role: 'user', content: forcePrompt });
+
+  if (state.hasSentIntro) {
     ws.send(JSON.stringify(createBubbleBreak()));
-    console.log(`  [>] bubble_break sent (intro was sent, separating from body)`);
+    console.log('  [>] bubble_break sent (intro → forced body)');
   }
 
-  await sendFinalResponseAsChunks(
-    ws, finalText,
-    finalResolved.emotions, finalResolved.overall_intensity,
-    nextChunkId, ttsEnabled, !hasSentIntro
-  );
+  if (!STREAMING_ENABLED) {
+    // 一括生成版
+    try {
+      const result = await callLLM(messages);
+      applyParsedContent(result, state, null);
+    } catch (e) {
+      console.warn(`  [!] Forced response failed: ${e.message}`);
+    }
+    if (state.finalText) {
+      await sendTextAsChunks(ws, state.finalText, {
+        nextChunkId, audioSender, voiceParams: bodyVoiceParams,
+        isFirst: !state.hasSentIntro,
+      });
+      state.hasStreamedBody = true;
+    }
+    return;
+  }
 
-  ws.send(JSON.stringify(createChatEnd({
-    fullText: finalText,
-    emotions: finalRawEmotions,
-  })));
+  // ストリーミング版（tools なしなので callLLMStream をそのまま使える）
+  const extractor = new StreamingTextExtractor();
+  const timer = createChunkTimer('body');
+  let rawContent = '';
+  let isFirst = !state.hasSentIntro;
 
-  const t2 = Date.now();
-  console.log(
-    `[>] chat_end: emotions=${JSON.stringify(finalResolved.emotions)}, ` +
-    `overall=${finalResolved.overall_intensity}, dominant=${finalResolved.emotion}, ` +
-    `text_len=${finalText.length}, toolTurns=${seenToolCalls.size}, ` +
-    `total=${t2 - t0}ms`
-  );
+  try {
+    for await (const token of callLLMStream(messages)) {
+      rawContent += token;
+      const chunks = normalizeToChunks(extractor.feed(token));
+      for (const chunk of chunks) {
+        const chunkId = nextChunkId();
+        ws.send(JSON.stringify(createTextChunk({ text: chunk, chunkId, isFirst })));
+        audioSender.enqueue(chunkId, chunk, bodyVoiceParams);
+        timer.mark(chunk);
+        isFirst = false;
+        state.hasStreamedBody = true;
+      }
+    }
 
-  const userContent = buildUserContentWithImage(userMessage, imageDescription);
-  await memoryStore.createEvent({
-    actorId,
-    sessionId,
-    payload: [
-      { role: Role.USER, content: { text: userContent } },
-      { role: Role.ASSISTANT, content: { text: finalText } },
-    ],
-  });
+    const remaining = normalizeToChunks(extractor.flush());
+    for (const chunk of remaining) {
+      const chunkId = nextChunkId();
+      ws.send(JSON.stringify(createTextChunk({ text: chunk, chunkId })));
+      audioSender.enqueue(chunkId, chunk, bodyVoiceParams);
+      timer.mark(chunk);
+      state.hasStreamedBody = true;
+    }
+  } catch (e) {
+    console.warn(`  [!] Body streaming failed: ${e.message}`);
+  }
 
-  if (imageDescription) {
-    console.log(`[+] Image described: "${imageDescription.slice(0, 60)}..."`);
+  timer.summary();
+  applyParsedContent(rawContent, state, extractor);
+}
+
+// ─────────────────────────────────────────────
+// 完成した JSON から text / emotions / image_description を回収
+// ─────────────────────────────────────────────
+
+function applyParsedContent(rawContent, state, extractor) {
+  const cleaned = stripJsonFence(rawContent);
+  if (!cleaned) return;
+
+  try {
+    const parsed = JSON.parse(cleaned);
+
+    if (parsed.text) state.finalText = parsed.text;
+
+    const parsedEmotions = sanitizeEmotions(parsed.emotions);
+    if (parsedEmotions) {
+      state.finalRawEmotions = parsedEmotions;
+    } else if (parsed.emotion) {
+      state.finalRawEmotions = emotionToEmotions(parsed.emotion, parsed.intensity);
+    }
+
+    if (parsed.image_description) {
+      state.imageDescription = parsed.image_description;
+    }
+  } catch (e) {
+    console.warn(`  [!] Failed to parse LLM JSON: ${e.message}`);
+
+    // JSON が壊れていても、抽出済みテキストがあれば本文として採用する
+    if (extractor && typeof extractor.getImageDescription === 'function') {
+      const desc = extractor.getImageDescription();
+      if (desc) state.imageDescription = desc;
+    }
+    if (!state.finalText && !state.hasStreamedBody) {
+      state.finalText = cleaned;
+    }
   }
 }
 
-async function sendFinalResponseAsChunks(ws, fullText, normalizedEmotions, overallIntensity, nextChunkId, ttsEnabled, isFirst) {
-  if (!fullText || fullText.length === 0) return;
+// ─────────────────────────────────────────────
+// 非ストリーミング時のテキスト送信（句読点分割）
+// ─────────────────────────────────────────────
+
+async function sendTextAsChunks(ws, fullText, io) {
+  const { nextChunkId, audioSender, voiceParams, isFirst } = io;
+  if (!fullText) return;
 
   const chunks = splitIntoChunks(fullText);
-  const voiceParams = ttsEnabled
-    ? getVoiceParamsFromEmotions(normalizedEmotions, overallIntensity)
-    : null;
-
-  const chunkInfos = chunks.map((chunk, i) => {
+  for (let i = 0; i < chunks.length; i++) {
     const chunkId = nextChunkId();
-    const isFirstChunk = isFirst && i === 0;
-
     ws.send(JSON.stringify(createTextChunk({
-      text: chunk,
+      text: chunks[i],
       chunkId,
-      isFirst: isFirstChunk,
+      isFirst: !!isFirst && i === 0,
     })));
-
-    const ttsPromise = ttsEnabled && voiceParams
-      ? synthesize(chunk, voiceParams)
-          .then(wavBuffer => ({ chunkId, chunk, wavBuffer, error: null }))
-          .catch(err => ({ chunkId, chunk, wavBuffer: null, error: err }))
-      : Promise.resolve(null);
-
-    return { chunkId, chunk, ttsPromise };
-  });
-
-  if (!ttsEnabled) return;
-
-  for (const { chunkId, chunk, ttsPromise } of chunkInfos) {
-    try {
-      const result = await Promise.race([
-        ttsPromise,
-        new Promise((_, reject) => setTimeout(() => reject(new Error('TTS timeout')), 15000)),
-      ]);
-
-      if (result && result.error) {
-        console.warn(`[!] TTS error for ${chunkId}: ${result.error.message}`);
-        continue;
-      }
-      if (!result || !result.wavBuffer) continue;
-
-      const audioBase64 = wavToBase64(result.wavBuffer);
-      ws.send(JSON.stringify(createAudioChunk({
-        chunkId,
-        audioBase64,
-        format: 'wav',
-      })));
-
-      console.log(
-        `[♪] audio_chunk sent: id=${chunkId}, ` +
-        `text_len=${chunk.length}, wav_size=${Math.floor(result.wavBuffer.length / 1024)}KB`
-      );
-    } catch (err) {
-      console.warn(`[!] TTS/send error for ${chunkId}: ${err.message}`);
-    }
+    audioSender.enqueue(chunkId, chunks[i], voiceParams);
   }
 }
 
@@ -707,30 +1100,8 @@ function splitIntoChunks(text) {
       current = '';
     }
   }
-  if (current.length > 0) {
-    chunks.push(current);
-  }
+  if (current.length > 0) chunks.push(current);
   return chunks;
-}
-
-async function synthesizeAndSend(ws, chunkId, text, voiceParams) {
-  const t0 = Date.now();
-  const wavBuffer = await synthesize(text, voiceParams);
-  const t1 = Date.now();
-  const audioBase64 = wavToBase64(wavBuffer);
-  const t2 = Date.now();
-
-  ws.send(JSON.stringify(createAudioChunk({
-    chunkId,
-    audioBase64,
-    format: 'wav',
-  })));
-
-  console.log(
-    `[♪] audio_chunk sent: id=${chunkId}, ` +
-    `text_len=${text.length}, wav_size=${Math.floor(wavBuffer.length / 1024)}KB, ` +
-    `synth=${t1 - t0}ms, encode=${t2 - t1}ms`
-  );
 }
 
 main().catch(err => {
