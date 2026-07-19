@@ -244,6 +244,128 @@
 // - 類似クエリの重複検知（query 先頭15文字）
 // - 空応答フォールバック
 // - 12感情 + 正規化 + overall_intensity
+// 【v16 での変更点】
+// 1. チャンク送信ごとにタイミングログを出す
+//    "[~] chunk +XXXms" が数百 ms 間隔で並べば真のストリーミング、
+//    全部同じ ms なら Ollama 側でバッファされている（＝一括送信と同じ）。
+//    切り分け用なので、確認が済んだら STREAM_TIMING_LOG=false で黙らせられる。
+//
+// 2. ツール実行後は tools を渡さない（MULTI_TURN_TOOLS=false が既定）
+//    v15 までは Turn 2 も tools 付きで呼んでいたため、Gemma 4 12B が
+//    同じツールを呼び直したり "tool_result" を捏造したりして 1 ターン無駄になり、
+//    LLM 呼び出しが 3 回（合計 36 秒）になっていた。
+//    ツール結果が messages に入った時点で tools を外し、
+//    callLLMStream（tools なし・format:'json'）で本文だけ生成する。
+//    → LLM 2 回で済み、ツール名の捏造も構造的に起きなくなる。
+//    多段ツール連鎖（天気を見てから検索、等）が必要になったら
+//    MULTI_TURN_TOOLS=true で v15 の挙動に戻せる。
+//
+// 【v15 / v15_fix からの継承】
+// - callLLMStreamWithTools による token 単位の真のストリーミング
+// - 未知ツール名を intro 送信前にフィルタ
+// - bubble_break（tool intro と本文の吹き出し分離）
+// - audio_chunk の送信順を chunk_id 順に直列化（合成は並列）
+// - 類似クエリの重複検知 / 空応答フォールバック / 12感情 + 正規化
+//
+//
+// 【v15 での変更点 — 本命】
+// ツール判断と本文生成を 1 パスに統合し、token 単位の真のストリーミングにした。
+//
+//   v14_fix2 まで:
+//     callLLMWithTools (stream:false) で全文生成
+//       → splitIntoChunks で機械的に分割
+//       → for ループで一気に ws.send
+//     → Flutter には数 ms 以内に全 chunk が到着し、体感は「一瞬で全文表示」
+//
+//   v15:
+//     callLLMStreamWithTools (stream:true) で token を受信
+//       → StreamingTextExtractor が JSON の text 値だけを増分抽出
+//       → 抽出できた瞬間に text_chunk 送信 + TTS 合成開始
+//     → 実測でチャンク間隔 140〜270ms、typewriter 表示になる
+//
+// 【なぜ 1 パスにしたか】
+// ツール判断を stream:false で別途行うと、ツール不要の通常応答（最も多く、
+// 最もストリーミングを見せたいケース）で全文生成が二重になり、体感が倍遅くなる。
+// Ollama 0.32.1 で Gemma 4 の tool calling が改善されたため、
+// tools 付き streaming を 1 パスで回す構成が現実的になった。
+//
+// 【text と tool_calls が両方来た場合】
+// Gemma 4 は tool_calls を返すとき content が空になる傾向があり、通常は
+// どちらか一方しか来ない。万一 text を送った後に tool_calls が来た場合は
+// 警告ログを出し、送信済みテキストは intro 扱い（bubble_break で本文と分離）にする。
+//
+// 【audio_chunk の順序保証】
+// TTS は chunk が確定した瞬間に並列で合成を開始するが、送信は Promise チェーンで
+// 直列化する。合成は並列（速い）、送信順は chunk_id 順（音声が本文通りに流れる）。
+//
+// 【v14 / v14_fix / v14_fix2 からの継承】
+// - bubble_break（tool intro と本文の吹き出し分離）
+// - needsHeavyProcessing 由来の filler 廃止
+// - unknown tool を throw せず error result で返す（lib/tools/index.js 側）
+// - 類似クエリの重複検知（query 先頭15文字）
+// - 空応答フォールバック
+// - 12感情 + 正規化 + overall_intensity
+// 【v16 での変更点】
+// 1. チャンク送信ごとにタイミングログを出す
+//    "[~] chunk +XXXms" が数百 ms 間隔で並べば真のストリーミング、
+//    全部同じ ms なら Ollama 側でバッファされている（＝一括送信と同じ）。
+//    切り分け用なので、確認が済んだら STREAM_TIMING_LOG=false で黙らせられる。
+//
+// 2. ツール実行後は tools を渡さない（MULTI_TURN_TOOLS=false が既定）
+//    v15 までは Turn 2 も tools 付きで呼んでいたため、Gemma 4 12B が
+//    同じツールを呼び直したり "tool_result" を捏造したりして 1 ターン無駄になり、
+//    LLM 呼び出しが 3 回（合計 36 秒）になっていた。
+//    ツール結果が messages に入った時点で tools を外し、
+//    callLLMStream（tools なし・format:'json'）で本文だけ生成する。
+//    → LLM 2 回で済み、ツール名の捏造も構造的に起きなくなる。
+//    多段ツール連鎖（天気を見てから検索、等）が必要になったら
+//    MULTI_TURN_TOOLS=true で v15 の挙動に戻せる。
+//
+// 【v15 / v15_fix からの継承】
+// - callLLMStreamWithTools による token 単位の真のストリーミング
+// - 未知ツール名を intro 送信前にフィルタ
+// - bubble_break（tool intro と本文の吹き出し分離）
+// - audio_chunk の送信順を chunk_id 順に直列化（合成は並列）
+// - 類似クエリの重複検知 / 空応答フォールバック / 12感情 + 正規化
+//
+//
+// 【v15 での変更点 — 本命】
+// ツール判断と本文生成を 1 パスに統合し、token 単位の真のストリーミングにした。
+//
+//   v14_fix2 まで:
+//     callLLMWithTools (stream:false) で全文生成
+//       → splitIntoChunks で機械的に分割
+//       → for ループで一気に ws.send
+//     → Flutter には数 ms 以内に全 chunk が到着し、体感は「一瞬で全文表示」
+//
+//   v15:
+//     callLLMStreamWithTools (stream:true) で token を受信
+//       → StreamingTextExtractor が JSON の text 値だけを増分抽出
+//       → 抽出できた瞬間に text_chunk 送信 + TTS 合成開始
+//     → 実測でチャンク間隔 140〜270ms、typewriter 表示になる
+//
+// 【なぜ 1 パスにしたか】
+// ツール判断を stream:false で別途行うと、ツール不要の通常応答（最も多く、
+// 最もストリーミングを見せたいケース）で全文生成が二重になり、体感が倍遅くなる。
+// Ollama 0.32.1 で Gemma 4 の tool calling が改善されたため、
+// tools 付き streaming を 1 パスで回す構成が現実的になった。
+//
+// 【text と tool_calls が両方来た場合】
+// Gemma 4 は tool_calls を返すとき content が空になる傾向があり、通常は
+// どちらか一方しか来ない。万一 text を送った後に tool_calls が来た場合は
+// 警告ログを出し、送信済みテキストは intro 扱い（bubble_break で本文と分離）にする。
+//
+// 【audio_chunk の順序保証】
+// TTS は chunk が確定した瞬間に並列で合成を開始するが、送信は Promise チェーンで
+// 直列化する。合成は並列（速い）、送信順は chunk_id 順（音声が本文通りに流れる）。
+//
+// 【v14 / v14_fix / v14_fix2 からの継承】
+// - bubble_break（tool intro と本文の吹き出し分離）
+// - needsHeavyProcessing 由来の filler 廃止
+// - unknown tool を throw せず error result で返す（lib/tools/index.js 側）
+// - 類似クエリの重複検知（query 先頭15文字）
+// - 空応答フォールバック
+// - 12感情 + 正規化 + overall_intensity
 
 require('dotenv').config();
 const { WebSocketServer } = require('ws');
@@ -252,6 +374,9 @@ const {
   callLLMStream,
   callLLMWithTools,
   callLLMStreamWithTools,
+  NUM_CTX,
+  THINKING_TOOLS,
+  THINKING_BODY,
 } = require('./lib/llm');
 const { buildMessages, getTimeContext } = require('./lib/prompt-builder');
 const { pickScene } = require('./lib/pick-scene');
@@ -479,9 +604,11 @@ async function main() {
   console.log(`  Tools: ${TOOL_DEFINITIONS.map(t => t.function.name).join(', ')}`);
   console.log(`  Max tool turns: ${MAX_TOOL_TURNS}`);
   console.log(`  Emotions: ${ALL_EMOTIONS.length} types (normalized + overall_intensity)`);
+  console.log(`  Context length: num_ctx=${NUM_CTX}`);
+  console.log(`  Thinking: tools=${THINKING_TOOLS ? 'ON' : 'OFF'}, body=${THINKING_BODY ? 'ON' : 'OFF'}`);
   console.log(`  Multi-turn tools: ${MULTI_TURN_TOOLS ? 'ON' : 'OFF (tools dropped after execution)'}`);
   console.log(`  Chunk timing log: ${STREAM_TIMING_LOG ? 'ON' : 'OFF'}`);
-  console.log(`  Protocol: v16 (bubble_break, ordered audio, token streaming)`);
+  console.log(`  Protocol: v18 (bubble_break, ordered audio, token streaming)`);
 
   if (!process.env.TAVILY_API_KEY) {
     console.warn('  ⚠ TAVILY_API_KEY not set, web_search will fail');
@@ -664,6 +791,9 @@ async function handleRequest(ws, picked, userMessage, hasImage, imageBase64Array
   // ── 空応答フォールバック ────────────────────────
   if (!state.finalText || state.finalText.trim() === '') {
     console.warn('  [!] Empty final response, using fallback message');
+    console.warn('      ヒント: 直前の [LLM] ログで prompt が num_ctx に近い場合、');
+    console.warn('      プロンプトが切り詰められて指示が失われている可能性がある');
+    console.warn('      → OLLAMA_NUM_CTX を上げるか、ツール結果を短くする');
     state.finalText = 'えっと……調べてはみたんだけど、うまく言葉にまとまらなかった。ごめん、もう一回聞いてくれる？';
     state.finalRawEmotions = { embarrassed: 0.5, sad: 0.3 };
 
